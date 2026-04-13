@@ -1,0 +1,41 @@
+# Build directories
+build/
+build-*/
+
+# Compiled binaries
+cuSpFFT
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# CUDA/C++ object files and deps
+*.o
+*.a
+*.so
+*.d
+*.ptx
+*.cubin
+*.fatbin
+
+# Profiler output
+profiles/
+
+# Dataset matrices (large binary files)
+dataset/**/*.mtx
+dataset/**/*.mtx.gz
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+CLAUDE.md
