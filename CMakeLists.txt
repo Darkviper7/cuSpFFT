@@ -15,8 +15,12 @@ find_package(CUDAToolkit REQUIRED)
 set(SOURCES
     src/main.cu
     src/mtx_reader.cu
-    src/sparse_fft.cu
     src/dense_baseline.cu
+    src/sparse_fft_bluestein.cu      # active benchmarks (Bluestein/Stockham/cuFFT)
+    src/sparse_fft_direct_dft.cu     # direct tiled COO DFT
+    src/sparse_fft_coo_2pass.cu      # COO 2-pass (custom DFT, cuFFT, GEMM)
+    src/sparse_fft_csc_2pass.cu      # CSC 2-pass (tiled col DFT + streaming)
+    src/sparse_fft_csr_2pass.cu      # CSR 2-pass
 )
 
 add_executable(cuSpFFT ${SOURCES})
