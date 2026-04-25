@@ -36,6 +36,31 @@ cuSpFFT/
     └── profile.sh              # Nsight Compute profiling helper
 ```
 
+**Purpose of each main folder:**
+
+- **`include/`** — public C/C++ headers consumed across translation units.
+  Contains the matrix-parser API (`mtx_reader.h`), dense cuFFT baseline
+  API (`dense_baseline.h`), CPU FFT reference API (`cpu_reference.h`),
+  the public sparse-FFT API (`sparse_fft.h`), and an internal
+  sparse-FFT helpers header (`sparse_fft_internal.cuh`) shared by all
+  `sparse_fft_*.cu` translation units.
+- **`src/`** — implementation files (`.cu` for CUDA device + host code,
+  `.cpp` for CPU-only code). Contains the CLI entry point (`main.cu`),
+  the Matrix Market parser (`mtx_reader.cu`), the dense cuFFT baseline
+  (`dense_baseline.cu`), the CPU FFTW3 reference (`cpu_reference.cpp`,
+  built only when `-DENABLE_CPU_REFERENCE=ON`), and the headline
+  binary-sparse FFT variants (`sparse_fft_bluestein.cu`). Additional
+  experimental sparse paths in `sparse_fft_csc_2pass.cu`,
+  `sparse_fft_coo_2pass.cu`, `sparse_fft_csr_2pass.cu`, and
+  `sparse_fft_direct_dft.cu` are preserved for ablation.
+- **`dataset/`** — Matrix Market `.mtx` input files. Populated by
+  `scripts/download_matrices.sh` from the SuiteSparse Matrix Collection;
+  not checked in.
+- **`scripts/`** — operational helpers. `download_matrices.sh` fetches
+  the three benchmark matrices (sstmodel, benzene, pct20stif) into
+  `dataset/`; `profile.sh` wraps Nsight Compute (`ncu`) for kernel-level
+  performance profiling.
+
 > Inside `src/main.cu`, benchmark blocks are grouped under HEADLINE /
 > DIAGNOSTIC / EXPERIMENTAL banner comments; see the **Appendix** for the
 > experimental flags and additional sparse paths preserved for ablation.
