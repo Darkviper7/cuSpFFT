@@ -11,6 +11,20 @@
 #include "mtx_reader.h"
 #include "dense_baseline.h"
 #include "sparse_fft.h"
+#ifdef HAS_SPFFT
+#include <spfft/spfft.hpp>
+#endif
+
+#ifdef HAS_SPFFT
+// Scatter COO entries (value=1) into a dense row-major float array for SpFFT.
+// Must use 64-bit index arithmetic (same rule as coo_to_dense in dense_baseline.cu).
+__global__ void spfft_scatter_kernel(const int* row_idx, const int* col_idx,
+                                     float* d_dense, int cols, int nnz) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < nnz)
+        d_dense[(size_t)row_idx[i] * cols + col_idx[i]] = 1.0f;
+}
+#endif
 
 // RAII NVTX range — push on construction, pop on destruction.
 struct NvtxRange {
@@ -158,7 +172,8 @@ static void print_usage(const char* prog) {
         "  --csc-stockham-cufft-stream  Add streaming variant using cuFFT C2C backend (minimal device memory)\n"
         "  --csc-stockham-graph   Add CUDA Graph replay Stockham variant\n"
         "  --dense-padded   Add dense cuFFT on zero-padded 7-smooth size (timing only, different freq grid)\n"
-        "  --csc-tile N     Output-row tile size for chunked CSC (default: 1024)\n",
+        "  --csc-tile N     Output-row tile size for chunked CSC (default: 1024)\n"
+        "  --spfft          SpFFT GPU baseline (requires HAS_SPFFT build)\n",
         prog);
 }
 
@@ -189,6 +204,7 @@ int main(int argc, char** argv) {
     bool csc_stockham_cufft_stream = false;
     bool csc_stockham_graph = false;
     bool dense_padded = false;
+    bool run_spfft    = false;
     int csc_tile     = 1024;
 
     for (int i = 2; i < argc; i++) {
@@ -210,6 +226,7 @@ int main(int argc, char** argv) {
         else if (f == "--csc-stockham-cufft-stream") csc_stockham_cufft_stream = true;
         else if (f == "--csc-stockham-graph") csc_stockham_graph = true;
         else if (f == "--dense-padded") dense_padded = true;
+        else if (f == "--spfft")       run_spfft    = true;
         else if (f == "--csc-tile") {
             if (++i >= argc)
                 throw std::runtime_error("--csc-tile requires an integer value");
@@ -532,6 +549,95 @@ int main(int argc, char** argv) {
         //                "Sparse CSR (2-pass)", "OOM", "OOM", e.what());
         //     }
         // }
+
+#ifdef HAS_SPFFT
+        // --- SpFFT GPU baseline (dense-input, all R2C frequency elements) ---
+        if (run_spfft) {
+            NvtxRange _range("SpFFT (baseline)");
+            try {
+                const int rows = coo.rows, cols = coo.cols;
+                const int n_freq = rows * (cols / 2 + 1);
+
+                // Upload COO indices to device
+                int *d_row = nullptr, *d_col = nullptr;
+                cuda_check(cudaMalloc(&d_row, (size_t)coo.nnz * sizeof(int)));
+                cuda_check(cudaMalloc(&d_col, (size_t)coo.nnz * sizeof(int)));
+                cuda_check(cudaMemcpy(d_row, coo.row_idx.data(),
+                    (size_t)coo.nnz * sizeof(int), cudaMemcpyHostToDevice));
+                cuda_check(cudaMemcpy(d_col, coo.col_idx.data(),
+                    (size_t)coo.nnz * sizeof(int), cudaMemcpyHostToDevice));
+
+                // Build R2C frequency triplets (x, y, 0): x=0..cols/2, y=0..rows-1
+                // y-outer / x-inner → row-major layout matching cuFFT R2C output
+                std::vector<int> indices;
+                indices.reserve((size_t)n_freq * 3);
+                for (int y = 0; y < rows; ++y)
+                    for (int x = 0; x <= cols / 2; ++x) {
+                        indices.push_back(x);
+                        indices.push_back(y);
+                        indices.push_back(0);
+                    }
+
+                // Create SpFFT Grid (single-precision float, 2D via dimZ=1).
+                // maxNumLocalZColumns = n_freq: for dimZ=1, each freq element is its own z-column.
+                spfft::GridFloat grid(cols, rows, 1, n_freq, SPFFT_PU_GPU, 0);
+                spfft::TransformFloat transform = grid.create_transform(
+                    SPFFT_PU_GPU, SPFFT_TRANS_R2C,
+                    cols, rows, 1, 1,
+                    n_freq, SPFFT_INDEX_TRIPLETS, indices.data());
+
+                // Fill SpFFT's internal GPU space-domain buffer via scatter kernel
+                float* d_space = transform.space_domain_data(SPFFT_PU_GPU);
+                cuda_check(cudaMemset(d_space, 0, (size_t)rows * cols * sizeof(float)));
+                spfft_scatter_kernel<<<(coo.nnz + 255) / 256, 256>>>(
+                    d_row, d_col, d_space, cols, coo.nnz);
+                cuda_check(cudaGetLastError());
+
+                // Output buffer on device for frequency elements
+                cuFloatComplex* d_freq = nullptr;
+                cuda_check(cudaMalloc(&d_freq, (size_t)n_freq * sizeof(cuFloatComplex)));
+
+                // Memory: SpFFT space-domain buffer (internal) + freq output + COO indices
+                // SpFFT allocates rows*cols floats internally for the space domain.
+                size_t mem_bytes = (size_t)rows * cols * sizeof(float)
+                                 + (size_t)n_freq * sizeof(cuFloatComplex)
+                                 + (size_t)coo.nnz * 2 * sizeof(int);
+
+                // Time forward transform only (space → frequency)
+                cudaEvent_t t0, t1;
+                cuda_check(cudaEventCreate(&t0));
+                cuda_check(cudaEventCreate(&t1));
+                cuda_check(cudaEventRecord(t0));
+                transform.forward(SPFFT_PU_GPU, (float*)d_freq, SPFFT_NO_SCALING);
+                cuda_check(cudaEventRecord(t1));
+                cuda_check(cudaEventSynchronize(t1));
+                float ms = 0.0f;
+                cuda_check(cudaEventElapsedTime(&ms, t0, t1));
+
+                printf("%-26s  %10.3f  %12.2f\n", "SpFFT (baseline)", ms, mem_bytes / 1e6);
+
+                // Correctness vs dense_ref
+                if (dense_ref.available) {
+                    SparseFFTResult fake{};
+                    fake.d_output    = d_freq;
+                    fake.output_cols = cols / 2 + 1;
+                    print_check("SpFFT", dense_ref, fake);
+                    fake.d_output = nullptr; // prevent double-free
+                }
+
+                cudaFree(d_freq);
+                cudaFree(d_row);
+                cudaFree(d_col);
+                cudaEventDestroy(t0);
+                cudaEventDestroy(t1);
+
+            } catch (const std::exception& e) {
+                printf("%-26s  %10s  %12s  [%s]\n",
+                       "SpFFT (baseline)", "OOM", "OOM", e.what());
+                cudaGetLastError();
+            }
+        }
+#endif
 
         printf("\n");
 

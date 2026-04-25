@@ -43,3 +43,11 @@ target_compile_options(cuSpFFT PRIVATE
 target_compile_definitions(cuSpFFT PRIVATE
     $<$<CONFIG:Debug>:DEBUG>
 )
+
+# Optional SpFFT reference baseline
+option(ENABLE_SPFFT "Enable SpFFT GPU baseline (requires libSpFFT with SPFFT_SINGLE_PRECISION=ON)" OFF)
+if(ENABLE_SPFFT)
+    find_package(SpFFT CONFIG REQUIRED)
+    target_compile_definitions(cuSpFFT PRIVATE HAS_SPFFT)
+    target_link_libraries(cuSpFFT PRIVATE SpFFT::spfft)
+endif()
