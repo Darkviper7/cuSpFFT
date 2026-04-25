@@ -86,14 +86,16 @@ cmake -S . -B build \
 cmake --build build -j$(nproc)
 ```
 
-### Optional baselines
+### Baseline and reference build options
 
-The two reference baselines (SpFFT and the CPU FFT) are independent CMake
-options. Both are off by default; the binary still builds and runs without
-them, the corresponding flags simply become no-ops.
+SpFFT is part of the required performance comparison for this project, but
+it depends on an external SpFFT installation, so it is enabled through an
+explicit CMake option. The CPU FFTW3 path is optional and used only for
+independent correctness checking.
 
-**SpFFT (`-DENABLE_SPFFT=ON`)** — install SpFFT (CUDA backend, single
-precision) somewhere accessible and pass `-DCMAKE_PREFIX_PATH=/path/to/spfft/install`.
+**SpFFT baseline (`-DENABLE_SPFFT=ON`)** — install SpFFT (CUDA backend,
+single precision) somewhere accessible and pass
+`-DCMAKE_PREFIX_PATH=/path/to/spfft/install`.
 Build SpFFT with:
 
 ```bash
@@ -120,7 +122,7 @@ tar xzf fftw-3.3.10.tar.gz && cd fftw-3.3.10
 make -j$(nproc) && make install
 ```
 
-Full build with both baselines enabled:
+Full evaluation build with SpFFT and CPU correctness reference enabled:
 
 ```bash
 cmake -S . -B build \
@@ -396,8 +398,9 @@ sparsity beats dense cuFFT *without* calling cuFFT").
     --repeat 10
 ```
 
-Dense cuFFT runs by default. SpFFT, CPU reference, and the two
-binary-sparse headline variants are opt-in.
+Dense cuFFT runs by default. For the full headline comparison, run a build
+with `-DENABLE_SPFFT=ON` and pass `--spfft`; CPU reference and the two
+binary-sparse headline variants are selected by their flags.
 
 ## CLI flags relevant to the headline variants
 
