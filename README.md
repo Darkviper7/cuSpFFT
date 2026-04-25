@@ -141,9 +141,9 @@ cmake --build build -j$(nproc)
 
 | Matrix | Source | Size | Role |
 |---|---|---|---|
-| `HB/sstmodel` | SuiteSparse | 3,345 × 3,345 (~22.7k nnz) | Dev / correctness checks (small) |
-| `PARSEC/benzene` | SuiteSparse | 8,219 × 8,219 (~242k nnz) | Headline comparison vs dense cuFFT |
-| `Boeing/pct20stif` | SuiteSparse | 52,329 × 52,329 (~2.7M nnz) | Large-scale OOM test (>50k nodes) |
+| `HB/sstmodel` | [SuiteSparse / HB/sstmodel](https://sparse.tamu.edu/HB/sstmodel) | 3,345 × 3,345 (~22.7k nnz) | Dev / correctness checks (small) |
+| `PARSEC/benzene` | [SuiteSparse / PARSEC/benzene](https://sparse.tamu.edu/PARSEC/benzene) | 8,219 × 8,219 (~242k nnz) | Headline comparison vs dense cuFFT |
+| `Boeing/pct20stif` | [SuiteSparse / Boeing/pct20stif](https://sparse.tamu.edu/Boeing/pct20stif) | 52,329 × 52,329 (~2.7M nnz) | Large-scale OOM test (>50k nodes) |
 
 All values are binarized to 1 on read — the algorithms exploit only the
 sparse pattern, not the original numeric values.
@@ -152,12 +152,15 @@ sparse pattern, not the original numeric values.
 
 # Variants implemented
 
-The headline benchmark compares **four** variants — two baselines and two
-of our optimized binary-sparse paths — plus an optional CPU FFT ground
-truth used for independent correctness validation. Every other path in
-the codebase is moved into a clearly-marked `EXPERIMENTAL / ABLATION`
-section in `main.cu` and exists only for ablation studies; nothing has
-been deleted.
+The headline comparison reports four performance variants: dense cuFFT,
+SpFFT, our custom binary-sparse FFT with no cuFFT calls, and the same
+binary-sparse pipeline using cuFFT only for the 1-D Bluestein convolution.
+The CPU FFTW3 path is correctness-only ground truth, not a performance
+competitor. The streaming sparse variant is reported separately for the
+large-matrix case where full device output storage becomes the limiting
+factor. Every other path in the codebase is moved into a clearly-marked
+`EXPERIMENTAL / ABLATION` section in `main.cu` and exists only for
+ablation studies; nothing has been deleted.
 
 ## 0. CPU FFT reference (FFTW3 single-precision, optional)
 
@@ -195,18 +198,28 @@ is dominated by:
 - Complex output: `rows × (cols/2+1) × 8` bytes.
 - cuFFT row-column transpose scratch: roughly equal to the output size.
 
-For pct20stif (52,329²), `cufftPlan2d` fails with `CUFFT_INTERNAL_ERROR`
-because `52329 = 3 × 17443` (17443 is prime — cuFFT cannot factor it).
-Padding to the next 7-smooth size (52488²) makes the plan succeed but the
-in-place workspace alone needs 10.5 GB on top of an 11 GB data buffer — over
-21 GB total, OOM on a 24 GB card. Conclusion: dense cuFFT does not produce
-a result for the >50k-node test, *regardless* of GPU memory.
+For pct20stif (52,329²), the exact dense path fails at
+`cufftPlan2d(&plan, 52329, 52329, CUFFT_R2C)` before execution with
+`CUFFT_INTERNAL_ERROR` because `52329 = 3 × 17443` (17443 is prime and is
+hostile to cuFFT's planner). Padding to the next 7-smooth size (52488²)
+makes the plan succeed on our setup, but the in-place workspace alone
+needs 10.5 GB on top of an 11 GB data buffer — over 21 GB total, OOM on a
+24 GB card. Conclusion: on our RTX 4090 / CUDA 12.5 setup, exact dense
+cuFFT does not produce a result for the >50k-node test, and the padded
+dense timing is not an exact correctness baseline because it changes the
+frequency grid.
 
 ## 2. SpFFT (baseline reference)
 
 **Source:** inline in `src/main.cu` (under `#ifdef HAS_SPFFT`).
 **External library:** [eth-cscs/SpFFT](https://github.com/eth-cscs/SpFFT)
 (MIT-licensed, plane-wave DFT library by CSCS).
+
+The reported SpFFT numbers were collected from an `-DENABLE_SPFFT=ON`
+build using SpFFT's CUDA backend in single precision, configured without
+MPI or OpenMP (`SPFFT_MPI=OFF`, `SPFFT_OMP=OFF`). The benchmark times only
+the GPU `transform.forward()` call after constructing the SpFFT grid and
+transform objects.
 
 SpFFT is a CUDA-aware sparse-frequency FFT library used in plane-wave
 electronic-structure codes. Its sparsity model is the *opposite* of ours:
@@ -373,7 +386,8 @@ sparsity beats dense cuFFT *without* calling cuFFT").
 # Usage
 
 ```bash
-# Headline benchmark on benzene with all four variants + CPU ground truth, 10-run medians
+# Headline benchmark on benzene with the four performance variants
+# plus CPU ground truth, 10-run medians
 ./build/cuSpFFT dataset/benzene/benzene.mtx \
     --cpu-reference \
     --spfft \
@@ -382,7 +396,8 @@ sparsity beats dense cuFFT *without* calling cuFFT").
     --repeat 10
 ```
 
-Dense cuFFT runs by default. The other four are opt-in.
+Dense cuFFT runs by default. SpFFT, CPU reference, and the two
+binary-sparse headline variants are opt-in.
 
 ## CLI flags relevant to the headline variants
 
@@ -443,7 +458,7 @@ dense is around the benzene size on this hardware.
 
 | Variant | Status |
 |---|---|
-| Dense cuFFT (baseline) | **`CUFFT_INTERNAL_ERROR`** — `52329 = 3 × 17443` (prime); cuFFT cannot factor it |
+| Dense cuFFT (baseline) | **`CUFFT_INTERNAL_ERROR` at `cufftPlan2d`** — `52329 = 3 × 17443` (prime); exact dense plan construction fails before execution |
 | SpFFT | OOM — single-rank limitation at this size |
 | CSC mixed-radix (custom) | 2,569 ms / 11.2 GB (fits but memory-tight at >50k nodes) |
 | CSC mixed-radix (cuFFT) | 893 ms / 11.3 GB (same memory class, faster) |
@@ -550,6 +565,7 @@ benchmark CLI blocks in `main.cu` are commented out.
 # References
 
 - [cuFFT documentation](https://docs.nvidia.com/cuda/cufft/)
+- [NVIDIA cuSPARSE storage formats](https://docs.nvidia.com/cuda/cusparse/storage-formats.html)
 - [SpFFT — open-source sparse FFT for CUDA](https://github.com/eth-cscs/SpFFT)
 - [SuiteSparse Matrix Collection](https://sparse.tamu.edu/)
 - [Matrix Market format](https://math.nist.gov/MatrixMarket/formats.html)
