@@ -1,42 +1,54 @@
 # cuSpFFT — Efficient GPU FFT Leveraging Binary Sparsity
 
-A CUDA implementation of 2-D FFT optimized for binary sparse matrices, targeting graph adjacency matrices and similar inputs where dense FFT is too slow or runs out of memory.
+A CUDA implementation of 2-D FFT optimized for **binary sparse matrices**,
+targeting graph adjacency matrices and similar inputs where dense FFT is
+either too slow or runs out of memory.
 
-## Motivation
+The codebase explores how far a custom GPU pipeline can go by exploiting
+two structural properties of the input:
+1. **Sparsity** — only the ~`nnz` nonzero entries contribute to the DFT sum;
+   the implementation never materializes the dense `rows × cols` grid.
+2. **Binarization** — every nonzero is exactly 1, so the values array is
+   eliminated entirely and indices are bit-packed (`uint16_t` when
+   `rows, cols ≤ 65k`).
 
-Standard GPU FFT libraries (cuFFT) treat all inputs as dense. For large sparse matrices — such as graph adjacency matrices with millions of nodes — this means:
-- Allocating a full `rows × cols` float array, often causing OOM.
-- Performing useless arithmetic on zeros.
-
-cuSpFFT exploits two properties of the input simultaneously:
-1. **Sparsity** — only nonzero entries contribute to the DFT sum.
-2. **Binarization** — all values are 0 or 1, enabling bit-packing and simplified arithmetic.
-
-## Project Structure
+## Repository layout
 
 ```
 cuSpFFT/
 ├── CMakeLists.txt
+├── README.md
 ├── include/
-│   ├── mtx_reader.h        # COO/CSR matrix structs and parser interface
-│   ├── dense_baseline.h    # Dense cuFFT baseline interface
-│   └── sparse_fft.h        # Sparse FFT interface (all variants)
+│   ├── mtx_reader.h            # COO/CSR parser interface
+│   ├── dense_baseline.h        # Dense cuFFT baseline interface
+│   ├── cpu_reference.h         # CPU FFT (FFTW3) ground-truth interface
+│   ├── sparse_fft.h            # All sparse FFT public APIs
+│   └── sparse_fft_internal.cuh # Shared device helpers, constants, CSC builder
 ├── src/
-│   ├── main.cu             # CLI entry point, benchmarking, correctness checking
-│   ├── mtx_reader.cu       # Matrix Market .mtx parser (binarizes values)
-│   ├── dense_baseline.cu   # COO → dense scatter + cuFFT R2C baseline
-│   └── sparse_fft.cu       # All sparse FFT kernels and host functions (~3200 lines)
-├── dataset/                # Place .mtx files here
+│   ├── main.cu                 # CLI entry, benchmark loop, correctness check
+│   ├── mtx_reader.cu           # Matrix Market .mtx parser (binarizes values)
+│   ├── dense_baseline.cu       # Dense scatter + cufftExecR2C baseline
+│   ├── cpu_reference.cpp       # CPU FFTW3 reference (built when ENABLE_CPU_REFERENCE=ON)
+│   └── sparse_fft_bluestein.cu # All variants used in the headline benchmark
+├── dataset/                    # Place .mtx files here
 └── scripts/
-    ├── download_matrices.sh  # Downloads all benchmark matrices
-    └── profile.sh            # Nsight Compute (ncu) profiling script
+    ├── download_matrices.sh    # Downloads the three benchmark matrices
+    └── profile.sh              # Nsight Compute profiling helper
 ```
 
-## Requirements
+> Inside `src/main.cu`, benchmark blocks are grouped under HEADLINE /
+> DIAGNOSTIC / EXPERIMENTAL banner comments; see the **Appendix** for the
+> experimental flags and additional sparse paths preserved for ablation.
 
-- CUDA 12.x (`/usr/local/cuda-12.5/bin/nvcc`)
-- CMake >= 3.20
-- cuFFT, cuBLAS, cuSPARSE, NVTX3 (included with CUDA Toolkit)
+## Machine configuration used for the reported numbers
+
+| Component | Value |
+|---|---|
+| GPU | NVIDIA GeForce RTX 4090 (24 GB, compute capability 8.9) |
+| Driver | 555.42.02 |
+| CUDA Toolkit | 12.5.82 (`/usr/local/cuda-12.5`) |
+| CMake | 3.20+ |
+| OS | Linux x86_64 |
 
 ## Build
 
@@ -49,280 +61,472 @@ cmake -S . -B build \
 cmake --build build -j$(nproc)
 ```
 
-Use `Debug` for development builds with assertions enabled.
+### Optional baselines
 
-## Usage
+The two reference baselines (SpFFT and the CPU FFT) are independent CMake
+options. Both are off by default; the binary still builds and runs without
+them, the corresponding flags simply become no-ops.
+
+**SpFFT (`-DENABLE_SPFFT=ON`)** — install SpFFT (CUDA backend, single
+precision) somewhere accessible and pass `-DCMAKE_PREFIX_PATH=/path/to/spfft/install`.
+Build SpFFT with:
 
 ```bash
-# Standard benchmark run (benzene)
-./build/cuSpFFT dataset/benzene/benzene.mtx \
-    --csc-stockham-smem \
-    --csc-stockham-cufft \
-    --csc-stockham-cufft-stream \
-    --csc-tile 128
+cmake -S /path/to/spfft -B /tmp/spfft-build \
+    -DSPFFT_GPU_BACKEND=CUDA -DSPFFT_SINGLE_PRECISION=ON \
+    -DSPFFT_MPI=OFF -DSPFFT_OMP=OFF \
+    -DCMAKE_INSTALL_PREFIX=$HOME/local \
+    -DCMAKE_INSTALL_RPATH=$HOME/local/lib \
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+cmake --build /tmp/spfft-build --target install -j$(nproc)
+```
+SpFFT requires both `libfftw3` and `libfftw3f`; install both before
+configuring SpFFT.
 
-# Include padded dense cuFFT comparison with correctness check
-./build/cuSpFFT dataset/benzene/benzene.mtx \
-    --csc-stockham-smem \
-    --csc-stockham-cufft \
-    --csc-stockham-cufft-stream \
-    --csc-tile 128 \
-    --dense-padded
+**CPU FFT reference (`-DENABLE_CPU_REFERENCE=ON`)** — uses FFTW3
+single-precision (`libfftw3f`) to compute an independent CPU ground-truth
+FFT. CMake searches `$HOME/local`, `/usr/local`, and `/usr` for
+`fftw3.h` and `libfftw3f`. To build FFTW3 single-precision locally:
 
-# Run streaming cuFFT on 50k+ node graph (~329 MB device, dense OOM expected)
-./build/cuSpFFT dataset/pct20stif/pct20stif.mtx \
-    --sparse-only \
-    --csc-stockham-cufft-stream \
-    --csc-tile 128
+```bash
+cd /tmp && curl -L -O https://www.fftw.org/fftw-3.3.10.tar.gz
+tar xzf fftw-3.3.10.tar.gz && cd fftw-3.3.10
+./configure --prefix=$HOME/local --enable-float --enable-shared
+make -j$(nproc) && make install
 ```
 
-### CLI Options
+Full build with both baselines enabled:
+
+```bash
+cmake -S . -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CUDA_ARCHITECTURES=native \
+    -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.5/bin/nvcc \
+    -DENABLE_SPFFT=ON \
+    -DENABLE_CPU_REFERENCE=ON \
+    -DCMAKE_PREFIX_PATH=$HOME/local
+cmake --build build -j$(nproc)
+```
+
+## Benchmark matrices
+
+```bash
+./scripts/download_matrices.sh   # downloads all three from SuiteSparse
+```
+
+| Matrix | Source | Size | Role |
+|---|---|---|---|
+| `HB/sstmodel` | SuiteSparse | 3,345 × 3,345 (~22.7k nnz) | Dev / correctness checks (small) |
+| `PARSEC/benzene` | SuiteSparse | 8,219 × 8,219 (~242k nnz) | Headline comparison vs dense cuFFT |
+| `Boeing/pct20stif` | SuiteSparse | 52,329 × 52,329 (~2.7M nnz) | Large-scale OOM test (>50k nodes) |
+
+All values are binarized to 1 on read — the algorithms exploit only the
+sparse pattern, not the original numeric values.
+
+---
+
+# Variants implemented
+
+The headline benchmark compares **four** variants — two baselines and two
+of our optimized binary-sparse paths — plus an optional CPU FFT ground
+truth used for independent correctness validation. Every other path in
+the codebase is moved into a clearly-marked `EXPERIMENTAL / ABLATION`
+section in `main.cu` and exists only for ablation studies; nothing has
+been deleted.
+
+## 0. CPU FFT reference (FFTW3 single-precision, optional)
+
+**Source:** `src/cpu_reference.cpp`, function `cpu_fft_r2c_2d()`.
+**Flag:** `--cpu-reference` (requires `-DENABLE_CPU_REFERENCE=ON` build).
+
+Not a competitor — a *ground truth*. Provides independent third-party
+validation of the entire CUDA pipeline by computing the same 2-D R2C FFT
+on the host CPU using FFTW3 single-precision. When `--cpu-reference` is
+set, this runs **first** and its output becomes the reference vector that
+every subsequent variant — including dense cuFFT and SpFFT — is checked
+against.
+
+Pipeline:
+1. Allocate FFTW-aligned buffers; scatter the binarized COO into the
+   `rows × cols` real input.
+2. `fftwf_plan_dft_r2c_2d(rows, cols, ..., FFTW_ESTIMATE)` → `fftwf_execute`.
+3. Host-side complex output (`rows × (cols/2+1)`, binary-compatible with
+   `cuFloatComplex`) becomes the reference.
+
+## 1. Dense cuFFT (baseline)
+
+**Source:** `src/dense_baseline.cu`, function `dense_fft()`.
+
+The conventional GPU FFT route:
+1. Scatter the COO entries into a dense `rows × cols` `float` array on device
+   (`coo_to_dense` kernel; uses 64-bit index arithmetic to avoid `int32`
+   overflow at 50k+ rows).
+2. Run `cufftExecR2C` for an out-of-place real-to-complex 2-D FFT.
+3. Output is `rows × (cols/2 + 1)` complex (R2C half-spectrum).
+
+This is the **correctness reference** for the sparse paths. Its peak memory
+is dominated by:
+- Dense input: `rows × cols × 4` bytes.
+- Complex output: `rows × (cols/2+1) × 8` bytes.
+- cuFFT row-column transpose scratch: roughly equal to the output size.
+
+For pct20stif (52,329²), `cufftPlan2d` fails with `CUFFT_INTERNAL_ERROR`
+because `52329 = 3 × 17443` (17443 is prime — cuFFT cannot factor it).
+Padding to the next 7-smooth size (52488²) makes the plan succeed but the
+in-place workspace alone needs 10.5 GB on top of an 11 GB data buffer — over
+21 GB total, OOM on a 24 GB card. Conclusion: dense cuFFT does not produce
+a result for the >50k-node test, *regardless* of GPU memory.
+
+## 2. SpFFT (baseline reference)
+
+**Source:** inline in `src/main.cu` (under `#ifdef HAS_SPFFT`).
+**External library:** [eth-cscs/SpFFT](https://github.com/eth-cscs/SpFFT)
+(MIT-licensed, plane-wave DFT library by CSCS).
+
+SpFFT is a CUDA-aware sparse-frequency FFT library used in plane-wave
+electronic-structure codes. Its sparsity model is the *opposite* of ours:
+SpFFT computes a 3-D FFT of dense spatial data evaluated at a specified
+sparse subset of frequency points. We use it as a baseline by:
+1. Scattering the COO entries into the SpFFT space-domain GPU buffer.
+2. Configuring SpFFT with **all** R2C frequency triplets `(x, y, 0)` for
+   `x ∈ [0, cols/2]`, `y ∈ [0, rows−1]`, `z = 0` — i.e. the full output.
+3. Running `transform.forward(SPFFT_PU_GPU, ...)` and reading the result.
+
+This is the closest external reference: a CUDA sparse FFT library, called
+on the same matrices, that explicitly does **not** exploit the binary
+nature of the input. SpFFT's overheads (3-D layout via `dimZ = 1`, sparse-
+frequency indexing infrastructure, single-rank MPI scaffolding) prevent it
+from beating cuFFT on this dense-output use case — see the Performance
+section.
+
+## 3. CSC mixed-radix, custom 1-D FFT (`--csc-mixed-radix`)
+
+**Source:** `src/sparse_fft_bluestein.cu`, function
+`sparse_fft_csc_bluestein_mixed_radix()`.
+**This is the variant that demonstrates "binary-sparse helps on its own,
+without calling cuFFT anywhere in the pipeline."**
+
+### Pipeline
+
+```
+COO  ─▶ host-side CompactCSC (active columns, packed uint16 row indices)
+        │
+        ▼
+        binary CSC pass-1 build  ───▶  signal[u_local, c]  (per u-tile)
+        │
+        ▼
+        custom radix-{2,3,9} Stockham FFT  (length fft_len = next_3_smooth(2·cols−1))
+        │
+        ▼
+        pointwise multiply by precomputed B = FFT(b)
+        │
+        ▼
+        custom radix-{2,3,9} inverse Stockham FFT + 1/N scale
+        │
+        ▼
+        bluestein_finalize_kernel (chirp_conj multiply)  ───▶  d_out
+```
+
+### Optimizations specific to the binary-sparse + custom-FFT story
+
+#### CompactCSC representation (binary + sparsity)
+
+The host builds a *compact* CSC where columns with no nonzeros are skipped:
+- `sparse_cols`: the list of active column indices.
+- `col_ptr`: prefix-sum offsets into `row_idx` (length `n_sparse_cols + 1`).
+- `row_idx`: row indices of nonzeros.
+
+For matrices with `rows, cols ≤ 65,536`, both `sparse_cols` and `row_idx`
+are stored as `uint16_t` on device — halving the index bandwidth. There is
+no `values` array because every nonzero is 1.
+
+#### Pass-1 build kernel (`csc_build_bluestein_input_packed_kernel`)
+
+For each output-row tile `[u_base, u_base + tile_rows)`, build the
+chirp-modulated signal:
+
+```
+signal[u_local, c] = chirp[c] · Σ_{r ∈ rows(c)} exp(−2πi · r · u / rows)
+```
+
+Layout: `blockIdx.x = col_id`, `blockIdx.y` = u-block index,
+`threadIdx.x = u_local within the block`. All threads in a block share the
+same `col_id`, so `row_idx[p]` reads hit the L1 broadcast path instead of
+scattering across 32 distinct `col_id` rows. (The earlier 2-D coalesced
+layout had 91% wasted L2 sector traffic from the strided `row_idx` access
+pattern; switching to this 1-D layout was a major speedup.)
+
+The kernel iterates only the `nnz` row indices in each column — never
+visits zero entries. No `values` are loaded because every nonzero is 1.
+
+#### Bluestein with `next_3_smooth(2·cols−1)` FFT length
+
+The Bluestein chirp-z transform converts an arbitrary-length-`cols` DFT
+into a length-`fft_len` convolution, where `fft_len ≥ 2·cols − 1`. We pick
+the **smallest 3-smooth size** ≥ `2·cols − 1` (factors only from {2, 3}).
+
+- For `benzene` (`cols = 8219`): `2·cols−1 = 16437` → `fft_len = 17496 = 2³·3⁷`.
+  The naive `next_pow2 = 32768` would do ~1.87× more FFT work for no gain.
+- For `sstmodel` (`cols = 3345`): `fft_len = 6912 = 2⁸·3³` (vs 8192 pow2).
+- For `pct20stif` (`cols = 52329`): `fft_len = 110592 = 2¹²·3³` (vs 131072).
+
+#### Custom radix-{2, 3, 9} Stockham kernels
+
+Three kernels in `sparse_fft_bluestein.cu` make up the FFT engine:
+- `stockham_stage_kernel` — radix-2 Stockham butterfly, one stage per launch.
+- `stockham_radix3_stage_kernel` — radix-3 Stockham butterfly with output
+  twiddle.
+- `stockham_radix9_stage_kernel` — **fused radix-9** = two radix-3 stages
+  in registers via the 3×3 Kronecker decomposition. Replaces 2
+  global-memory roundtrips with 1.
+
+The host driver `run_fft_mixed_23` decomposes `fft_len` into a factor list
+that prefers radix-9 over pairs of radix-3:
+
+| `fft_len` | Factor list | # global passes |
+|---|---|---|
+| 6912 = 2⁸·3³ | `[9, 3, 2, 2, 2, 2, 2, 2, 2, 2]` | 10 |
+| 17496 = 2³·3⁷ | `[9, 9, 9, 3, 2, 2, 2]` | 7 |
+| 110592 = 2¹²·3³ | `[9, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]` | 12 |
+
+Compared to a pure radix-2 Stockham at `next_pow2`, this is **roughly half**
+the FFT work on benzene (smaller `fft_len` × fewer stages). Profiling with
+ncu confirms each stage is memory-bandwidth-bound at ~85% of DRAM peak;
+fusing two radix-3 stages into radix-9 directly shaves 2× on those
+roundtrips, which is the dominant cost.
+
+### Memory
+
+- One tile of `signal[tile_rows, fft_len]` and one ping-pong work buffer of
+  the same size — `2 × tile × fft_len × 8` bytes.
+- Full output `d_out[rows, output_stride]` on device.
+- Negligible: `chirp[cols]`, `B_fft[fft_len]`, packed CSC indices.
+
+## 4. CSC mixed-radix, cuFFT 1-D FFT (`--csc-cufft-smooth`)
+
+**Source:** `src/sparse_fft_bluestein.cu`, function
+`sparse_fft_csc_bluestein_cufft_smooth()`.
+
+Identical pipeline to variant 3 except the 1-D FFT engine is **cuFFT**
+instead of our custom radix-{2,3,9} kernels:
+
+```
+... binary CSC pass-1 ─▶ signal[u_local, c]
+                ▼
+        cufftExecC2C(FORWARD)   (length fft_len = next_7_smooth(2·cols−1))
+                ▼
+        pointwise multiply by B_fft
+                ▼
+        cufftExecC2C(INVERSE) + 1/N scale
+                ▼
+        bluestein_finalize_kernel ─▶ d_out
+```
+
+Two parameter changes vs variant 3:
+- `fft_len = next_7_smooth(2·cols − 1)` (factors from {2, 3, 5, 7}). cuFFT
+  has hand-tuned mixed-radix kernels for any 7-smooth size, so we use a
+  smaller fft_len than the 3-smooth one our custom kernels need.
+  - benzene: 16464 = 2⁴·3·7³ (vs 17496 for 3-smooth, 32768 for pow2)
+  - sstmodel: 6720 = 2⁶·3·5·7 (vs 6912, 8192)
+  - pct20stif: 110592 (same as 3-smooth here — already smooth enough)
+- `cufftPlanMany` + `cufftExecC2C` replace `run_fft_mixed_23`.
+
+The pass-1 build, chirp/B precompute, pointwise multiply, scale, and
+finalize kernels are *bit-identical reuses* of variant 3.
+
+### Why this exists
+
+It isolates exactly one question: **holding the binary-sparse pass-1 and
+Bluestein scaffolding fixed, does cuFFT's mixed-radix beat our hand-rolled
+mixed-radix?** The answer (see Performance section) is yes — by ~30% on
+benzene — but the gap is closer than the comparison against power-of-2 cuFFT
+would suggest, and it does not undo variant 3's central claim ("binary
+sparsity beats dense cuFFT *without* calling cuFFT").
+
+---
+
+# Usage
+
+```bash
+# Headline benchmark on benzene with all four variants + CPU ground truth, 10-run medians
+./build/cuSpFFT dataset/benzene/benzene.mtx \
+    --cpu-reference \
+    --spfft \
+    --csc-mixed-radix \
+    --csc-cufft-smooth \
+    --repeat 10
+```
+
+Dense cuFFT runs by default. The other four are opt-in.
+
+## CLI flags relevant to the headline variants
 
 | Flag | Effect |
 |---|---|
-| `--sparse-only` | Skip dense cuFFT baseline |
-| `--dense-only` | Skip all sparse FFT methods |
-| `--csc-stockham-smem` | Bluestein+Stockham with smem row FFT (auto-fallback for fft_len > 4096) |
-| `--csc-stockham-cufft` | Bluestein with cuFFT C2C batched FFT (~2× faster than custom Stockham) |
-| `--csc-stockham-cufft-stream` | Streaming Bluestein+cuFFT — lowest device footprint, best for large matrices |
-| `--dense-padded` | Padded dense cuFFT (next 7-smooth size, in-place R2C) with correctness check vs exact baseline |
-| `--csc-tile N` | Output-row tile size for streaming CSC (default: 1024) |
+| (default) | Dense cuFFT baseline runs unless `--sparse-only` |
+| `--cpu-reference` | Run CPU FFT (FFTW3) **first** and use it as the correctness reference for ALL variants (requires `-DENABLE_CPU_REFERENCE=ON` build) |
+| `--spfft` | Run the SpFFT baseline (requires `-DENABLE_SPFFT=ON` build) |
+| `--csc-mixed-radix` | Variant 3 — binary CSC + custom radix-{2,3,9} Stockham |
+| `--csc-cufft-smooth` | Variant 4 — binary CSC + cuFFT at 7-smooth fft_len |
+| `--csc-tile N` | Output-row tile size for the tiled CSC pipelines (default: 1024 for compatibility; tile=128 is what we use in the headline runs) |
+| `--repeat N` | Run each benchmark `N + 1` times (1 warmup + N timed); report median plus min/max bracket. Default 1 (single-run, no warmup). |
+| `--sparse-only` | Skip the dense cuFFT baseline |
+| `--dense-only` | Skip the sparse variants |
 
-## Benchmark Matrices
+Additional flags exist for ablation studies; see the **Appendix** for the
+list. Run `./build/cuSpFFT --help` for the complete reference.
 
-Download all three with:
-```bash
-./scripts/download_matrices.sh
-```
+---
 
-| Matrix | Nodes | Use |
+# Performance
+
+All numbers are medians of 10 timed runs (`--repeat 10`) after one warmup.
+Time is the kernel-loop wall time measured with CUDA events. Memory is the
+device-side **runtime peak** measured via `cudaMemGetInfo` between baseline
+capture and cleanup — it includes cuFFT/SpFFT internal workspace and graph
+state, not just our explicit allocations.
+
+Correctness (`max_abs vs CPU`) is the worst element-wise absolute error
+versus the CPU FFTW3 reference, captured with `--cpu-reference`.
+
+## Headline: benzene (8,219 × 8,219, density 0.36%, `--csc-tile 128`)
+
+| Variant | Median (ms) | Min / Max | Memory (MB) | max_abs vs CPU | vs Dense cuFFT |
+|---|---|---|---|---|---|
+| CPU FFT reference (FFTW3) | — | — | — | (correctness reference; not benchmarked) | — |
+| Dense cuFFT | 23.64 | 23.59 / 23.68 | 3,305 | 4.7e-02 | — |
+| SpFFT | ~32 | (single-run) | ~4,400 | 4.7e-02 | 0.74× speed |
+| **CSC mixed-radix (custom 1-D FFT)** | **14.65** | **14.61 / 14.66** | **310** | **2.0e-01** | **1.61× faster, 10.7× less memory** |
+| CSC mixed-radix (cuFFT 1-D FFT) | 9.60 | 9.60 / 9.62 | 317 | 6.3e-02 | 2.46× faster, 10.4× less memory |
+
+## Small matrix: sstmodel (3,345 × 3,345, density 0.20%)
+
+| Variant | Median (ms) | Memory (MB) | max_abs vs CPU |
+|---|---|---|---|
+| CPU FFT reference (FFTW3) | — | — | (correctness reference; not benchmarked) |
+| Dense cuFFT | 0.85 | 289 | 3.1e-03 |
+| SpFFT | 2.08 | 457 | 3.1e-03 |
+| CSC mixed-radix (custom) | 3.62 | 65 | 2.0e-02 |
+| CSC mixed-radix (cuFFT) | 1.39 | 59 | 6.0e-03 |
+
+At small N, dense cuFFT wins on speed because the sparse path's per-tile
+launch overhead (~700 kernel launches even for the small fft_len) and CSC
+preprocessing dominate the kernel time. The crossover where sparse beats
+dense is around the benzene size on this hardware.
+
+## Large matrix: pct20stif (52,329 × 52,329, density 0.10%)
+
+| Variant | Status |
+|---|---|
+| Dense cuFFT (baseline) | **`CUFFT_INTERNAL_ERROR`** — `52329 = 3 × 17443` (prime); cuFFT cannot factor it |
+| SpFFT | OOM — single-rank limitation at this size |
+| CSC mixed-radix (custom) | 2,569 ms / 11.2 GB (fits but memory-tight at >50k nodes) |
+| CSC mixed-radix (cuFFT) | 893 ms / 11.3 GB (same memory class, faster) |
+
+Both headline sparse variants run on pct20stif but are memory-tight
+because they hold the full output on device. See the **Appendix** for the
+streaming approach that bounds device memory by tile size and runs
+pct20stif at ~474 MB.
+
+## How sparsity and binary structure are exploited
+
+| Lever | Where it shows up | Effect on the numbers |
 |---|---|---|
-| HB/sstmodel | ~1–5k | Development and correctness checks |
-| PARSEC/benzene | ~8–10k | Benchmark against dense cuFFT |
-| Boeing/pct20stif | 52329 | Large-scale: dense OOM expected; `--csc-stockham-cufft-stream` runs in ~917 ms / 329 MB |
+| **No values array** | Pass-1 kernel never loads or multiplies by a value field; the input is fully described by indices | Halves the input bandwidth vs a non-binary equivalent |
+| **uint16-packed indices** | `pack_cols_u16` produces packed `row_idx` and `sparse_cols` whenever `rows, cols ≤ 65,536`; both CSC variants pick the packed kernel automatically via `can_pack_u16()` | Halves index bandwidth for benzene and sstmodel |
+| **CompactCSC: skip empty columns** | `make_compact_csc` prefixes only active columns; pass-2 work scales with `n_sparse_cols`, not `cols` | For graph-style matrices where many columns are inactive, this drops pass-2 work directly |
+| **Dense grid never materialized** | Pass-1 writes only `(u, c)` slots that have at least one nonzero; the rest of `signal[u, c]` stays zero from the per-tile `cudaMemset` | Memory peak scales with `tile × fft_len`, not `rows × cols` — the reason variant 3 fits in 310 MB on a problem dense cuFFT needs 3.3 GB for |
+| **Bluestein + smooth `fft_len`** | Frees us from "size must be a power of 2 because the FFT kernel requires it" — variants 3 and 4 each pick a smooth size suited to their FFT engine | Halves FFT work on benzene compared to power-of-2 |
+| **Custom radix-9 fusion** | `stockham_radix9_stage_kernel` — two radix-3 stages in registers | One global-memory roundtrip instead of two; 30% fewer total stages on benzene |
+| **CUDA event timing with peak-mem capture** | `DeviceMemPeak` RAII helper in `sparse_fft_bluestein.cu` brackets each variant; `--repeat N` runs N+1 timed iterations and reports median + min/max | Trustworthy benchmark numbers; close-margin rankings (mr vs cufft-smooth) become statistically resolvable |
+| **CPU FFTW3 ground truth** | `--cpu-reference` runs FFTW3 first; every CUDA variant (dense cuFFT, SpFFT, custom mr, cufft-smooth) is checked against the same reference | Independent third-party correctness validation against the CPU result |
 
-Source: [SuiteSparse Matrix Collection](https://sparse.tamu.edu/)
+---
 
-## Approach
+# Limitations and remaining issues
 
-### Problem Statement
+- **Small matrices (sstmodel-class, ≤ ~5k nodes):** dense cuFFT wins by a
+  large margin. The sparse pipeline's per-tile launch overhead and CSC
+  preprocessing don't amortize. A useful future direction is a single-tile
+  fast path for matrices small enough to fit `fft_len × rows` in
+  reasonable device memory.
+- **Mixed radix only goes to {2, 3}:** adding radix-5 and radix-7 kernels
+  would let the custom path use the same 7-smooth `fft_len` cuFFT picks
+  (16464 instead of 17496 on benzene); this would close ~5% of the gap to
+  the cuFFT variant.
+- **SpFFT comparison is approximate:** SpFFT's setup cost (Grid +
+  Transform creation, sparse-frequency index registration) is bundled into
+  the reported time on small matrices. We time only the `transform.forward()`
+  call but the first call still pays cold-start costs.
 
-For a binary sparse matrix A with nonzero set `{(r, c)}`, the 2-D DFT is:
+---
 
-```
-F[u, v] = sum_{(r, c) in nnz} exp(-2πi · (r·u/rows + c·v/cols))
-```
-
-All methods exploit the fact that the sum has only `nnz` terms instead of `rows × cols`.
-
-### Dense Baseline
-
-Converts COO to a full float matrix on the GPU, then calls `cufftExecR2C` for a standard 2-D real-to-complex FFT. Output is `rows × (cols/2 + 1)` (R2C half-spectrum). Serves as the correctness reference for all sparse methods.
-
-The scatter kernel uses 64-bit index arithmetic (`(size_t)row * cols + col`) to avoid int32 overflow for matrices with more than ~46k rows. A cuFFT workspace size check (`cufftGetSize` + `cudaMemGetInfo`) runs before execution so that workspace OOM throws a clean exception rather than triggering a sticky hardware memory fault.
-
-### Dense Baseline (Padded, `--dense-padded`)
-
-When `cufftPlan2d` fails because the matrix dimensions contain large prime factors, `dense_fft_padded` rounds rows and cols up to the nearest 7-smooth number (factors only from {2, 3, 5, 7}) and runs in-place R2C. In-place mode uses a single buffer (`2 × (pcols/2+1)` floats per row) shared by the real input and complex output, halving static memory vs out-of-place (~11 GB instead of ~22 GB for 52k nodes).
-
-**The padded output is NOT equivalent to the original transform** — frequency bins shift from `k/N` to `k/N'`, so it cannot serve as a correctness reference for sparse methods. A correctness check is printed against the exact dense baseline anyway to quantify the difference; expect large errors (e.g. `max_abs ~2e5` for benzene) since the two outputs are at different frequencies.
-
-### Sparse FFT: Tiled Direct DFT (COO) *(disabled)*
-
-One thread per output bin `(u, v)` loops over all `nnz` entries. COO arrays are tiled through shared memory to reduce global-memory traffic. Full complex output (`output_cols = cols`). Currently commented out in the benchmark CLI.
-
-- **Complexity:** O(nnz × rows × cols)
-- **Memory:** O(nnz + rows × cols)
-
-### Two-Pass Decomposition
-
-All other sparse methods use a two-pass factorization that separates the row and column exponentials:
-
-```
-Pass 1:  G[col_id][u] = sum_{r : (r,c) in nnz}  exp(-2πi · r·u/rows)
-Pass 2:  F[u, v]      = sum_i  G[i][u] · exp(-2πi · sparse_cols[i]·v/cols)
-```
-
-G is compact: only `n_sparse_cols` columns (those with at least one nonzero) are stored, stored **column-major** (`G[col_id * rows + u]`) so pass-1 writes are coalesced.
-
-Output is the R2C half-spectrum: `output_cols = cols/2 + 1`.
-
-### Sparse FFT: Two-Pass COO *(disabled)*
-
-Pass 1 uses atomic adds to scatter each nonzero `(r, c)` into `G[col_id][u]` for all output rows `u`. Pass 2 uses a custom `col_dft_kernel` that tiles sparse column indices through shared memory. Currently commented out in the benchmark CLI.
-
-- **Complexity:** O(nnz × rows + rows × output_cols × n_sparse_cols)
-- **Memory:** O(nnz + rows × n_sparse_cols + rows × output_cols)
-
-### Sparse FFT: Two-Pass COO + cuFFT Pass 2 *(disabled)*
-
-Same pass 1 as COO, but uses a full-sized dense G (`cols` columns) so cuFFT can run a batched C2C transform for pass 2. Currently commented out in the benchmark CLI.
-
-### Sparse FFT: Two-Pass COO + GEMM Pass 2 *(disabled)*
-
-Same compact COO pass 1. Pass 2 materializes the twiddle matrix `W[i, v] = exp(-2πi·sparse_cols[i]·v/cols)` and calls `cublasCgemm` for `F = G^T × W`. Currently commented out in the benchmark CLI.
-
-- **Memory:** O(nnz + rows × n_sparse_cols + n_sparse_cols × output_cols + rows × output_cols)
-
-### Sparse FFT: Two-Pass CSC
-
-Builds a compact CSC representation from the COO input. Pass 1 assigns one thread block per active column, eliminating all atomics. Pass 2 is the same custom `col_dft_kernel`.
-
-All `sparse_fft_csc_2pass` benchmark blocks are currently commented out, including cached-W and tiled-p2 sub-variants.
-
-- **Complexity:** O(nnz × rows + rows × output_cols × n_sparse_cols)
-- **Memory:** O(nnz + col_ptr + rows × n_sparse_cols + rows × output_cols)
-
-#### Tiled Pass-2 (`--csc-tiled-p2`)
-
-`col_dft_chunk_tiled_kernel` loads `CSC_TILED_C × (CSC_TILED_U × RBU)` G tiles and
-`CSC_TILED_C × (CSC_TILED_V × RBV)` W tiles into shared memory, then accumulates into
-`RBU × RBV = 2 × 4` register arrays per thread. Key tuning decisions:
-
-- `CSC_TILED_C = 32` — halved from 64 to fit 16 KB smem and lift occupancy on V100.
-- `RBV = 4` — each v-block covers 4× more output columns, reducing G_chunk DRAM reads by ~4×.
-- Stride-coalesced v-layout ensures all output stores remain coalesced regardless of RBV.
-- `fmaf()` for all complex multiply-accumulates in the inner loop.
-- Output stride padded to next multiple of 4 complex values for L2 sector alignment.
-
-### Sparse FFT: CSC + Bluestein Column FFT (`--csc-bluestein`, `--csc-stockham`, `--csc-stockham-smem`, `--csc-stockham-cufft`)
-
-Instead of a direct DFT for pass 2, `sparse_fft_csc_bluestein` computes the column transform
-via the Bluestein chirp-z convolution, which reduces arbitrary-length DFT to a power-of-2 FFT:
-
-```
-1. signal[u][c] = G[c][u] · chirp[c]       (chirp modulation)
-2. A = FFT(signal)                           (forward power-of-2 FFT, length fft_len)
-3. C = A ⊙ B_fft                            (pointwise multiply with precomputed B = FFT(b))
-4. c = IFFT(C)                               (inverse FFT)
-5. F[u][v] = c[u][v] · chirp_conj[v]        (finalize)
-```
-
-where `fft_len = next_pow2(2·cols - 1)` and `chirp[k] = exp(-iπk²/cols)`.
-
-Three FFT backends are available via the `fft_backend` parameter:
-
-- **`fft_backend=0` (default):** Out-of-place Stockham FFT with per-stage kernel launches.
-  Step 3 is fused into the first IFFT stage via `stockham_stage_mul_kernel` to save one pass.
-  Ping-pong buffers; stream helpers return the result pointer (no D2D copy).
-  *(benchmark block currently disabled)*
-
-- **`fft_backend=1` (`--csc-stockham-smem`):** Shared-memory staged Stockham — entire row held
-  in smem across all butterfly stages, eliminating O(log₂ N) round-trips to DRAM.
-  Automatically falls back to `fft_backend=0` when `fft_len > 4096` (smem limit ≈ 96 KB V100).
-
-- **`fft_backend=3` (`--csc-stockham-cufft`):** cuFFT C2C batched — replaces the custom
-  Stockham with `cufftExecC2C` (forward + inverse). cuFFT's internal smem-staged butterflies
-  collapse log₂(N) global passes to O(1), giving ~2× speedup over custom Stockham on
-  typical graph matrices (benzene: ~28.5 ms → ~13.4 ms; sstmodel: ~2.6 ms → ~1.0 ms).
-
-Stockham kernel optimizations (backends 0 and 1):
-- `fmaf()` in all butterfly outputs and chirp products.
-- Branchless `stockham_two_stage_kernel`: fused radix-4 with predicated selects instead of divergent warp branches.
-- 1-D build kernel layout for chirp-modulated signal construction: `blockIdx.x = col_id`, `threadIdx.x = u_local`. All threads in a block share the same column, so `row_idx[p]` reads hit the L1 broadcast path rather than scattering across 32 different offsets (the 2-D coalesced layout had 91% excessive sector traffic on this access).
-- Stream functions return the result buffer pointer — no device-to-device copy when stage count is odd.
-
-- **Output:** R2C half-spectrum, `output_cols = cols/2 + 1`.
-- **Memory:** O(nnz + rows × fft_len × 2 + rows × output_cols) per tile.
-
-### Sparse FFT: Streaming and Graph Variants (`--csc-stockham-stream`, `--csc-stockham-graph`)
-
-- **Streaming Stockham (`sparse_fft_csc_stockham_streaming`):** double-buffered with two CUDA streams, overlapping FFT on one tile with D2H transfer of the previous. Output to host-pinned memory; `d_output` is `nullptr`. Peak device memory: `O(tile × fft_len)`.
-
-- **Streaming cuFFT (`sparse_fft_csc_bluestein_cufft_streaming`, `--csc-stockham-cufft-stream`):** same streaming layout as above but uses cuFFT C2C for the FFT stages. Skips `d_work` (in-place cuFFT on `d_signal`) — saves `tile × fft_len × 8` bytes vs the Stockham streaming variant. Suitable for 50k+ node graphs where even the Bluestein non-streaming variant OOMs on `d_out`. `mem_bytes` includes the cuFFT internal workspace via `cufftGetSize`. On pct20stif (52329×52329): **~917 ms, 329 MB** on an RTX 4090 (24 GB).
-
-- **Graph (`sparse_fft_csc_stockham_graph`):** captures the entire tile-loop body as a CUDA Graph during a dry run, then replays the instantiated graph. Eliminates per-tile kernel-launch overhead at the cost of fixed tile size for all iterations.
-
-### Sparse FFT: Two-Pass CSR *(disabled)*
-
-Converts COO to CSR. Pass 1 assigns `(output_row u, source_row r)` pairs to threads, computing `exp(-2πi·r·u/rows)` once per pair and distributing over all nonzero columns in that row. Reduces `sincosf` calls from `nnz × rows` (COO) to `rows²`. Currently commented out in the benchmark CLI.
-
-- **Complexity:** O(rows² + nnz × rows + rows × output_cols × n_sparse_cols)
-- **Memory:** O(nnz + row_ptr + rows × n_sparse_cols + rows × output_cols)
-
-### 16-Bit Packing
-
-For `rows ≤ 65536` and `cols ≤ 65536`, all kernels use 16-bit packed storage:
-- COO: `uint32_t` packing `(row << 16 | col_id)`
-- CSR/CSC column indices: `uint16_t`
-- Sparse column list: `uint16_t`
-
-This halves memory bandwidth for index arrays on typical graph matrices.
-
-## Output and Correctness Checking
-
-All sparse methods produce an R2C-style half-spectrum output (`SparseFFTResult.output_cols = cols/2+1`), except the COO+cuFFT variant which produces full complex output (`output_cols = cols`). For Bluestein and streaming variants, `output_cols` reflects the padded stride which may be slightly larger than `cols/2+1`.
-
-When `--sparse-only` is not specified, the dense cuFFT output is copied to host and used as a correctness reference. For each sparse method, the benchmark prints:
-
-```
-  check <method>  max_abs <value>  max_rel <value>  rms_abs <value>
-```
-
-## Profiling
+# Profiling
 
 ```bash
-./scripts/profile.sh [matrix.mtx] [extra args...]
+./scripts/profile.sh dataset/benzene/benzene.mtx --csc-mixed-radix --csc-tile 128
 ```
 
-Runs an Nsight Compute (ncu) pass and writes a `.ncu-rep` report file to `profiles/`:
-- `ncu_<name>_sparse.ncu-rep` — custom sparse kernels matched by name regex:
-  `csc_build_bluestein_input_coalesced_packed_kernel`, `stockham_smem_row.*`,
-  `pointwise_mul_batched_kernel`, `scale_complex_kernel`, `bluestein_finalize_kernel`
+Wraps `ncu --set full` with a kernel-name regex covering the variant's
+kernels. Writes a `.ncu-rep` file under `profiles/` for inspection in
+`ncu-ui`. Requires sudo for hardware counters (or set
+`NVreg_RestrictProfilingToAdminUsers=0` once on the host).
 
-Extra arguments after the matrix path are forwarded to the binary (e.g. `--csc-stockham-smem --csc-tile 128`).
+The full-set profile of variant 3 on benzene shows ~83% of GPU time in
+the Stockham FFT stages (radix-3 dominant at 58%, radix-2 at 25%) — every
+stage memory-bandwidth-bound at ~85% of DRAM peak. Pass-1 is only 7.4% of
+total time despite the `sincosf`-per-nonzero pattern, so further work
+would target FFT stage fusion, not the build kernel.
 
-Open with `ncu-ui profiles/<file>.ncu-rep`. Requires sudo for hardware counters (or set `NVreg_RestrictProfilingToAdminUsers=0` once).
+---
 
-## Observations
+# Appendix: Experimental variants and future directions
 
-Empirical findings from running benchmarks on the three matrix datasets (RTX 4090, 24 GB).
+These paths are preserved in the codebase but are not part of the
+headline four-variant story. Each is callable via its individual
+`--csc-*` flag; the implementations live in `src/sparse_fft_bluestein.cu`
+(or other `src/sparse_fft_*.cu` files for the disabled variants) and
+remain compiled in.
 
-### pct20stif: dense cuFFT cannot run regardless of hardware
+## Streaming — future direction for very-large matrices
 
-`cufftPlan2d` for pct20stif (52329×52329) fails with `CUFFT_INTERNAL_ERROR` (code 5) on every GPU. The root cause is arithmetic: **52329 = 3 × 17443**, and 17443 is prime. cuFFT cannot factor a size-17443 transform efficiently and fails to construct the plan — this is not an OOM, it is a hard algorithmic limitation independent of how much device memory is available.
+For matrices large enough that the full output (`rows × output_stride × 8`
+bytes) does not comfortably fit on a single GPU — pct20stif at 52,329²
+needs ~10.7 GB just for the output — a streaming pipeline that
+double-buffers tiles and writes completed slices to host-pinned memory
+keeps the device footprint bounded by `tile × fft_len`.
 
-### Padding to a smooth size does not help
+The codebase already includes an experimental cuFFT-based streaming path
+(`--csc-stockham-cufft-stream`) that demonstrates the approach on
+pct20stif at ~474 MB device peak. **Future work** is to port the
+headline variant 3's custom radix-{2,3,9} kernels to the same streaming
+driver, yielding a no-cuFFT path that also scales to >50k matrices.
 
-The next 7-smooth number ≥ 52329 is **52488 = 2³ × 3⁸**. Even with in-place R2C (one ~11 GB buffer instead of separate 11 GB input + 11 GB output), `cufftPlan2d(52488, 52488)` succeeds but then **`cufftGetSize` reports a 10.5 GB internal workspace requirement**. After the 11 GB data buffer, only ~2.5 GB of the 24 GB card is free — execution fails before a single kernel launches.
+## Other experimental flags (preserved, ablation only)
 
-The 10.5 GB workspace is cuFFT's row-column scratch buffer: the 2D algorithm transposes the full complex intermediate between the row-pass and column-pass, allocating a scratch array equal to the full output size.
+- `--csc-stockham-smem` — Bluestein with shared-memory Stockham (radix-2 only; falls back to per-stage for `fft_len > 4096`)
+- `--csc-stockham-cufft` — Bluestein + cuFFT, non-streaming, at `next_pow2(2·cols−1)` fft_len (variant 4 supersedes this)
+- `--csc-stockham-cufft-stream` — same as above, streaming (the variant that runs pct20stif today)
+- `--csc-binary-lut` — Pass-1 with byte-mask + per-tile LUT instead of sincosf-per-nonzero; cuFFT, streaming
+- `--csc-binary-stockham-smem` — Same byte-mask LUT pass-1 with the Stockham smem FFT path
+- `--csc-mixed-radix-graph` — Variant 3 wrapped in a CUDA Graph for reduced launch overhead
+- `--dense-padded` — Dense cuFFT zero-padded to next 7-smooth size (note: padded transform uses a different frequency grid)
 
-| Dense cuFFT attempt | Static data | cuFFT workspace | Total needed | Fits in 24 GB? |
-|---|---|---|---|---|
-| Original size (52329²), out-of-place | ~22 GB | — (plan fails) | — | No (plan fails) |
-| Padded size (52488²), out-of-place | ~22 GB | 10.5 GB | ~32.5 GB | No |
-| Padded size (52488²), in-place | ~11 GB | 10.5 GB | ~21.5 GB | No |
-| **Sparse CSC cufft stream** | **0.33 GB** | **none** | **0.33 GB** | **Yes** |
+## Disabled paths still in source tree
 
-### Why sparse streaming succeeds where dense cannot
+The codebase also contains direct-DFT, COO 2-pass (custom DFT / cuFFT /
+GEMM), CSC 2-pass (cached-W, tiled-p2, half-G, streaming), and CSR
+2-pass kernels in `src/sparse_fft_direct_dft.cu`, `sparse_fft_coo_2pass.cu`,
+`sparse_fft_csc_2pass.cu`, and `sparse_fft_csr_2pass.cu`. Their
+benchmark CLI blocks in `main.cu` are commented out.
 
-The streaming sparse method never materialises a dense grid. Its memory depends on `tile × fft_len`, not `rows × cols`:
+---
 
-- **Pass 1 (build G):** only touches `nnz = 2.7M` entries, not `rows × cols = 2.74B`.
-- **Bluestein pass 2:** pads internally to `next_pow2(2 × 52329 - 1) = 131072` — a clean power of 2 that cuFFT C2C handles with a tiny workspace.
-- **Streaming output:** only one tile of `d_signal` (`128 × 131072 × 8 = 134 MB`) lives on device at a time; completed tiles are copied to host-pinned memory asynchronously.
-- **No row-column scratch:** cuFFT's 1D `cufftPlanMany` for batched 1D C2C transforms does not require the full 2D transpose scratch buffer.
+# References
 
-### Memory accounting note
-
-The reported 329 MB is **peak device memory only**. The full output (`rows × output_cols × 8 ≈ 10.9 GB`) accumulates in host-pinned memory via streaming D2H transfers. Host memory is more abundant and cheaper to allocate, but it is not free — a complete accounting includes both.
-
-### Correctness scope
-
-Correctness is verified against the dense cuFFT reference on sstmodel and benzene (matrices small enough for dense to run). For pct20stif, no reference exists; results are extrapolated from algorithm correctness on smaller matrices. The padded dense output cannot serve as a reference because it computes at different frequency bins.
-
-### cuFFT's 2D workspace scales with transform size
-
-For any `cufftPlan2d` of size `M × N`, the internal workspace is approximately `M × (N/2+1) × 8` bytes (the full complex half-spectrum). This is the cost of the transpose in the row-column algorithm. For 52488²: `52488 × 26245 × 8 ≈ 11 GB`. On any GPU with ≤ 22 GB free after loading the transform data, this will OOM.
-
-## References
-
-- [cuFFT Documentation](https://docs.nvidia.com/cuda/cufft/)
-- [cuBLAS Documentation](https://docs.nvidia.com/cuda/cublas/)
-- [cuSPARSE Storage Formats](https://docs.nvidia.com/cuda/cusparse/storage-formats.html)
+- [cuFFT documentation](https://docs.nvidia.com/cuda/cufft/)
 - [SpFFT — open-source sparse FFT for CUDA](https://github.com/eth-cscs/SpFFT)
-- [Matrix Market Format](https://math.nist.gov/MatrixMarket/formats.html)
 - [SuiteSparse Matrix Collection](https://sparse.tamu.edu/)
+- [Matrix Market format](https://math.nist.gov/MatrixMarket/formats.html)
 - [Bluestein chirp-z transform](https://en.wikipedia.org/wiki/Chirp_Z-transform)
-- [Stockham FFT](https://www.fftw.org/newsgroup-archives/na-digest/v95/na.95_05.01#v95_05_13)
+- Temperton (1983), *Self-sorting in-place fast Fourier transforms* — Stockham auto-sort algorithm.

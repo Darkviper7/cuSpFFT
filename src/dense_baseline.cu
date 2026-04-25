@@ -49,10 +49,11 @@ DenseFFTResult dense_fft(const COOMatrix& coo) {
     // R2C output: rows × (cols/2+1) complex values (half-spectrum).
     const size_t output_complex = (size_t)rows * (cols / 2 + 1);
 
-    // Estimate peak memory: dense input (float) + output (cuFloatComplex) + COO indices
-    size_t peak = dense_floats * sizeof(float)
-                + output_complex * sizeof(cuFloatComplex)
-                + (size_t)coo.nnz * 2 * sizeof(int);
+    // Capture baseline free device memory; peak = baseline - min_free_during_run,
+    // measured right before cleanup.
+    size_t base_free = 0, _tot = 0;
+    cudaMemGetInfo(&base_free, &_tot);
+    size_t peak = 0;
 
     // All pointers initialised to null so the cleanup block can safely free
     // whichever subset was successfully allocated before an exception.
@@ -109,6 +110,12 @@ DenseFFTResult dense_fft(const COOMatrix& coo) {
         float ms = 0.f;
         CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
 
+        // Sample free memory at peak (cuFFT workspace lazily allocated by cufftExecR2C
+        // is included; everything is still live).
+        size_t peak_free = 0;
+        cudaMemGetInfo(&peak_free, &_tot);
+        peak = (peak_free < base_free) ? base_free - peak_free : 0;
+
         cudaEventDestroy(t0);
         cudaEventDestroy(t1);
         cufftDestroy(plan);
@@ -148,8 +155,9 @@ DenseFFTResult dense_fft_padded(const COOMatrix& coo) {
     const int    inembed    = 2 * (pcols / 2 + 1);
     const size_t buf_floats = (size_t)prows * inembed;
 
-    size_t peak = buf_floats * sizeof(float)
-                + (size_t)coo.nnz * 2 * sizeof(int);
+    size_t base_free = 0, _tot = 0;
+    cudaMemGetInfo(&base_free, &_tot);
+    size_t peak = 0;
 
     int *d_row = nullptr, *d_col = nullptr;
     float* d_buf = nullptr;
@@ -200,6 +208,10 @@ DenseFFTResult dense_fft_padded(const COOMatrix& coo) {
 
         float ms = 0.f;
         CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
+
+        size_t peak_free = 0;
+        cudaMemGetInfo(&peak_free, &_tot);
+        peak = (peak_free < base_free) ? base_free - peak_free : 0;
 
         cudaEventDestroy(t0);
         cudaEventDestroy(t1);

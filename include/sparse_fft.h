@@ -97,6 +97,51 @@ SparseFFTResult sparse_fft_csc_stockham_streaming(const COOMatrix& coo, int u_ti
 SparseFFTResult sparse_fft_csc_bluestein_cufft_streaming(const COOMatrix& coo, int u_tile = 128);
 SparseFFTResult sparse_fft_csc_stockham_graph(const COOMatrix& coo, int u_tile = 128);
 
+// Experimental binary-CSC variant with byte-mask + LUT pass 1.
+//   - Compresses each active column's row indices into (byte_pos, byte_mask) pairs
+//     where each byte covers 8 consecutive row positions.
+//   - Per u-tile, precomputes:
+//       LUT_inner[u_local][mask] = Σ over set bits j in mask of exp(-2πi · j · u / rows)
+//       byte_phase[u_local][byte_pos] = exp(-2πi · 8·byte_pos · u / rows)
+//   - Pass 1 uses these tables instead of a sincosf per nonzero row:
+//       contribution(byte_pos, mask) = byte_phase[u_local][byte_pos] · LUT_inner[u_local][mask]
+//   - Bluestein convolution and finalize identical to the cuFFT streaming path,
+//     so timing differences isolate the binary-specific front-end change.
+SparseFFTResult sparse_fft_csc_bluestein_binary_lut(const COOMatrix& coo, int u_tile = 128);
+
+// Experimental mixed-radix {2, 3} Stockham Bluestein variant (no cuFFT).
+// Uses fft_len = next_3_smooth(2·cols−1) instead of next_pow2 — for benzene
+// that's 18432 vs 32768 (~0.56× the work).  Combined with binary CSC pass-1
+// (no values, packed indices) the goal is to beat dense cuFFT timing without
+// any cuFFT call anywhere in the path.  Non-streaming; allocates full d_out.
+SparseFFTResult sparse_fft_csc_bluestein_mixed_radix(const COOMatrix& coo, int u_tile = 128);
+
+// Same algorithm as sparse_fft_csc_bluestein_mixed_radix but the entire tile
+// loop is captured into a CUDA Graph and launched with a single API call,
+// reducing per-tile kernel-launch latency on small matrices where launch
+// overhead (~5 µs × hundreds of launches) dominates the runtime.
+SparseFFTResult sparse_fft_csc_bluestein_mixed_radix_graph(const COOMatrix& coo, int u_tile = 128);
+
+// "Best-possible cuFFT" baseline for the README's cuFFT comparison.
+// Same Bluestein scaffolding as sparse_fft_csc_bluestein_cufft, but with
+// fft_len = next_7_smooth(2·cols−1) instead of next_pow2.  cuFFT efficiently
+// handles 7-smooth sizes via its own internal mixed-radix; for benzene this
+// cuts fft_len from 32768 down to 16464, halving FFT work.  Non-streaming.
+SparseFFTResult sparse_fft_csc_bluestein_cufft_smooth(const COOMatrix& coo, int u_tile = 128);
+
+// Experimental non-streaming binary-CSC variant using the Stockham smem FFT path.
+// Same byte-mask + LUT pass 1 as sparse_fft_csc_bluestein_binary_lut, but the
+// Bluestein convolution uses run_fft_power2_stockham_smem_stream (auto-falls
+// back to the per-stage Stockham loop for fft_len > SMEM_MAX_FFT_N) and the
+// fused stockham_smem_row_mul_inverse_kernel for the inverse half — no cuFFT.
+// Allocates the full d_out = rows × output_stride on device (non-streaming).
+//
+// Set the environment variable CUSPFFT_BREAKDOWN=1 to enable per-phase timing
+// breakdown (LUT precompute / pass-1 / FFT-mul-IFFT / finalize), printed to
+// stdout after the main timing line.  Per-tile sync adds small overhead, so
+// the reported total may be slightly higher than without breakdown.
+SparseFFTResult sparse_fft_csc_stockham_binary_smem(const COOMatrix& coo, int u_tile = 128);
+
 // Two-pass sparse FFT (CSR):
 // Same two-pass decomposition as sparse_fft_2pass, but built on CSR format.
 //

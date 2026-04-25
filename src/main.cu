@@ -14,6 +14,9 @@
 #ifdef HAS_SPFFT
 #include <spfft/spfft.hpp>
 #endif
+#ifdef HAS_CPU_REF
+#include "cpu_reference.h"
+#endif
 
 #ifdef HAS_SPFFT
 // Scatter COO entries (value=1) into a dense row-major float array for SpFFT.
@@ -31,6 +34,53 @@ struct NvtxRange {
     explicit NvtxRange(const char* label) { nvtxRangePushA(label); }
     ~NvtxRange()                          { nvtxRangePop(); }
 };
+
+// Repeats fn N+1 times: 1 warmup (discarded) + N timed (when n_iters > 1),
+// or 1 timed run (when n_iters == 1, matching legacy behavior).  Returns the
+// LAST result with .ms set to the median of the timed runs.  Optional
+// out_min/out_max receive the min/max of the timed runs (untouched if n_iters == 1).
+//
+// Result must have a `cuFloatComplex* d_output` field that is either nullptr
+// or owned by the caller (the helper cudaFree's intermediate results).
+template <typename Result, typename Fn>
+static Result run_repeated(int n_iters, Fn&& fn,
+                            float* out_min = nullptr, float* out_max = nullptr) {
+    Result result{};
+    std::vector<float> times;
+    times.reserve(n_iters);
+
+    if (n_iters > 1) {
+        result = fn();
+        if (result.d_output) { cudaFree(result.d_output); result.d_output = nullptr; }
+    }
+
+    for (int i = 0; i < n_iters; i++) {
+        if (i > 0 && result.d_output) { cudaFree(result.d_output); }
+        result = fn();
+        times.push_back(result.ms);
+    }
+
+    if (n_iters > 1) {
+        std::sort(times.begin(), times.end());
+        result.ms = times[n_iters / 2];
+        if (out_min) *out_min = times.front();
+        if (out_max) *out_max = times.back();
+    }
+    return result;
+}
+
+// Single-run mode: legacy 2-column output.
+// Multi-run mode:  median in column 2, [min/max] + n in trailing brackets.
+static void print_bench(const char* label, float median_ms, size_t mem_bytes,
+                         int n_iters, float min_ms, float max_ms) {
+    if (n_iters > 1) {
+        printf("%-26s  %10.3f  %12.2f  [min %.3f, max %.3f]  n=%d\n",
+               label, median_ms, mem_bytes / 1e6, min_ms, max_ms, n_iters);
+    } else {
+        printf("%-26s  %10.3f  %12.2f\n",
+               label, median_ms, mem_bytes / 1e6);
+    }
+}
 
 struct DenseReference {
     bool available = false;
@@ -63,6 +113,56 @@ static DenseReference make_dense_reference(const DenseFFTResult& dense, int rows
                           ref.h_freq.size() * sizeof(cuFloatComplex),
                           cudaMemcpyDeviceToHost));
     return ref;
+}
+
+#ifdef HAS_CPU_REF
+// Populate the reference from the CPU FFTW3 result.  Used when --cpu-reference
+// is set; the CPU output then becomes the ground truth that even dense cuFFT
+// and SpFFT are checked against.
+static DenseReference make_cpu_reference(CPUReferenceResult&& cpu, int cols) {
+    DenseReference ref;
+    ref.available = true;
+    ref.rows = cpu.rows;
+    ref.cols = cols;
+    ref.freq_cols = cpu.freq_cols;
+    ref.h_freq = std::move(cpu.output);
+    return ref;
+}
+#endif
+
+// Compare a dense d_output against the host reference.  Used for dense cuFFT
+// and dense-padded checks when the reference comes from a CPU FFT.
+static CheckStats compare_dense_to_ref(const DenseReference& ref,
+                                        const DenseFFTResult& dense) {
+    std::vector<cuFloatComplex> h_dense((size_t)ref.rows * ref.freq_cols);
+    cuda_check(cudaMemcpy(h_dense.data(), dense.d_output,
+                          h_dense.size() * sizeof(cuFloatComplex),
+                          cudaMemcpyDeviceToHost));
+
+    CheckStats stats;
+    double sum_sq = 0.0;
+    const size_t n = h_dense.size();
+    for (size_t i = 0; i < n; i++) {
+        const double dx = (double)h_dense[i].x - (double)ref.h_freq[i].x;
+        const double dy = (double)h_dense[i].y - (double)ref.h_freq[i].y;
+        const double abs_err = std::sqrt(dx * dx + dy * dy);
+        const double ref_mag = std::sqrt((double)ref.h_freq[i].x * ref.h_freq[i].x
+                                       + (double)ref.h_freq[i].y * ref.h_freq[i].y);
+        const double rel_err = abs_err / std::max(1.0, ref_mag);
+        stats.max_abs = std::max(stats.max_abs, abs_err);
+        stats.max_rel = std::max(stats.max_rel, rel_err);
+        sum_sq += abs_err * abs_err;
+    }
+    stats.rms_abs = std::sqrt(sum_sq / (double)n);
+    return stats;
+}
+
+static void print_dense_check(const char* method, const DenseReference& ref,
+                                const DenseFFTResult& dense) {
+    if (!ref.available) return;
+    CheckStats s = compare_dense_to_ref(ref, dense);
+    printf("  check %-19s  max_abs %.3e  max_rel %.3e  rms_abs %.3e\n",
+           method, s.max_abs, s.max_rel, s.rms_abs);
 }
 
 static CheckStats compare_sparse_to_dense(const DenseReference& ref,
@@ -173,7 +273,14 @@ static void print_usage(const char* prog) {
         "  --csc-stockham-graph   Add CUDA Graph replay Stockham variant\n"
         "  --dense-padded   Add dense cuFFT on zero-padded 7-smooth size (timing only, different freq grid)\n"
         "  --csc-tile N     Output-row tile size for chunked CSC (default: 1024)\n"
-        "  --spfft          SpFFT GPU baseline (requires HAS_SPFFT build)\n",
+        "  --spfft          SpFFT GPU baseline (requires HAS_SPFFT build)\n"
+        "  --csc-binary-lut Experimental binary-CSC byte-mask + LUT pass-1 + cuFFT (streaming)\n"
+        "  --csc-binary-stockham-smem  Experimental binary-CSC byte-mask + LUT pass-1 + Stockham smem (non-streaming)\n"
+        "  --csc-mixed-radix  Experimental binary-CSC + mixed-radix {2,3} Stockham Bluestein (no cuFFT)\n"
+        "  --csc-mixed-radix-graph  Same as --csc-mixed-radix but with CUDA Graph capture/replay\n"
+        "  --csc-cufft-smooth  cuFFT Bluestein with fft_len = next_7_smooth(2·cols−1) (best-possible cuFFT baseline)\n"
+        "  --cpu-reference  Compute CPU FFT reference (FFTW3, single-threaded); used as ground truth for ALL variants\n"
+        "  --repeat N       Run each benchmark N+1 times (1 warmup + N timed); report median, min, max (default 1)\n",
         prog);
 }
 
@@ -205,7 +312,14 @@ int main(int argc, char** argv) {
     bool csc_stockham_graph = false;
     bool dense_padded = false;
     bool run_spfft    = false;
+    bool csc_binary_lut = false;
+    bool csc_binary_stockham_smem = false;
+    bool csc_mixed_radix = false;
+    bool csc_mixed_radix_graph = false;
+    bool csc_cufft_smooth = false;
+    bool run_cpu_ref = false;
     int csc_tile     = 1024;
+    int repeat_iters = 1;
 
     for (int i = 2; i < argc; i++) {
         std::string f(argv[i]);
@@ -227,12 +341,25 @@ int main(int argc, char** argv) {
         else if (f == "--csc-stockham-graph") csc_stockham_graph = true;
         else if (f == "--dense-padded") dense_padded = true;
         else if (f == "--spfft")       run_spfft    = true;
+        else if (f == "--csc-binary-lut") csc_binary_lut = true;
+        else if (f == "--csc-binary-stockham-smem") csc_binary_stockham_smem = true;
+        else if (f == "--csc-mixed-radix") csc_mixed_radix = true;
+        else if (f == "--csc-mixed-radix-graph") csc_mixed_radix_graph = true;
+        else if (f == "--csc-cufft-smooth") csc_cufft_smooth = true;
+        else if (f == "--cpu-reference") run_cpu_ref = true;
         else if (f == "--csc-tile") {
             if (++i >= argc)
                 throw std::runtime_error("--csc-tile requires an integer value");
             csc_tile = std::stoi(argv[i]);
             if (csc_tile <= 0)
                 throw std::runtime_error("--csc-tile must be positive");
+        }
+        else if (f == "--repeat") {
+            if (++i >= argc)
+                throw std::runtime_error("--repeat requires an integer value");
+            repeat_iters = std::stoi(argv[i]);
+            if (repeat_iters <= 0)
+                throw std::runtime_error("--repeat must be positive");
         }
     }
 
@@ -248,15 +375,45 @@ int main(int argc, char** argv) {
         print_separator();
         DenseReference dense_ref;
 
+#ifdef HAS_CPU_REF
+        // --- CPU FFT reference (FFTW3) ---
+        // Runs FIRST so the CPU output becomes the ground truth; every CUDA
+        // variant — including dense cuFFT and SpFFT — is then checked against
+        // this independent reference.  Useful primarily for sstmodel and
+        // benzene; pct20stif is feasible but slow (tens of seconds, ~22 GB host).
+        if (run_cpu_ref) {
+            NvtxRange _range("CPU reference (FFTW3)");
+            try {
+                CPUReferenceResult cpu = cpu_fft_r2c_2d(coo);
+                printf("%-26s  %10.3f  %12.2f  [CPU, FFTW3 single-thread]\n",
+                       "CPU reference (FFTW3)", (float)cpu.ms, cpu.mem_bytes / 1e6);
+                dense_ref = make_cpu_reference(std::move(cpu), coo.cols);
+            } catch (const std::exception& e) {
+                printf("%-26s  %10s  %12s  [%s]\n",
+                       "CPU reference (FFTW3)", "FAIL", "FAIL", e.what());
+            }
+        }
+#endif
+
         // --- Dense cuFFT baseline ---
         if (run_dense) {
             NvtxRange _range("Dense cuFFT (baseline)");
             try {
-                DenseFFTResult dr = dense_fft(coo);
-                if (run_sparse || run_2pass || run_csr)
+                // Track whether the reference was already populated by something
+                // else (CPU FFT) before we run — controls whether we cross-check
+                // dense cuFFT against it.  Comparing dense vs dense is a no-op.
+                const bool ref_was_external = dense_ref.available;
+                float min_ms = 0, max_ms = 0;
+                DenseFFTResult dr = run_repeated<DenseFFTResult>(repeat_iters,
+                    [&] { return dense_fft(coo); }, &min_ms, &max_ms);
+                if (!dense_ref.available && (run_sparse || run_2pass || run_csr))
                     dense_ref = make_dense_reference(dr, coo.rows, coo.cols);
-                printf("%-26s  %10.3f  %12.2f\n",
-                       "Dense cuFFT (baseline)", dr.ms, dr.mem_bytes / 1e6);
+                print_bench("Dense cuFFT (baseline)", dr.ms, dr.mem_bytes,
+                            repeat_iters, min_ms, max_ms);
+                // If the reference came from elsewhere (CPU), check dense cuFFT
+                // against it — gives an explicit cuFFT-vs-CPU correctness number.
+                if (ref_was_external)
+                    print_dense_check("Dense cuFFT", dense_ref, dr);
                 cudaFree(dr.d_output);
             } catch (const std::exception& e) {
                 printf("%-26s  %10s  %12s  [%s]\n",
@@ -265,15 +422,181 @@ int main(int argc, char** argv) {
             }
         }
 
+        // ===========================================================================
+        // HEADLINE — variant 2 of 4: SpFFT (CSCS sparse-frequency FFT, baseline).
+        // Built and linked only when -DENABLE_SPFFT=ON.
+        // ===========================================================================
+#ifdef HAS_SPFFT
+        if (run_spfft) {
+            NvtxRange _range("SpFFT (baseline)");
+            try {
+                const int rows = coo.rows, cols = coo.cols;
+                const int n_freq = rows * (cols / 2 + 1);
+
+                // Capture baseline free device memory for runtime peak measurement.
+                size_t base_free = 0, _tot = 0;
+                cudaMemGetInfo(&base_free, &_tot);
+
+                // Upload COO indices to device
+                int *d_row = nullptr, *d_col = nullptr;
+                cuda_check(cudaMalloc(&d_row, (size_t)coo.nnz * sizeof(int)));
+                cuda_check(cudaMalloc(&d_col, (size_t)coo.nnz * sizeof(int)));
+                cuda_check(cudaMemcpy(d_row, coo.row_idx.data(),
+                    (size_t)coo.nnz * sizeof(int), cudaMemcpyHostToDevice));
+                cuda_check(cudaMemcpy(d_col, coo.col_idx.data(),
+                    (size_t)coo.nnz * sizeof(int), cudaMemcpyHostToDevice));
+
+                // Build R2C frequency triplets (x, y, 0): x=0..cols/2, y=0..rows-1
+                // y-outer / x-inner → row-major layout matching cuFFT R2C output
+                std::vector<int> indices;
+                indices.reserve((size_t)n_freq * 3);
+                for (int y = 0; y < rows; ++y)
+                    for (int x = 0; x <= cols / 2; ++x) {
+                        indices.push_back(x);
+                        indices.push_back(y);
+                        indices.push_back(0);
+                    }
+
+                // Create SpFFT Grid (single-precision float, 2D via dimZ=1).
+                // maxNumLocalZColumns = n_freq: for dimZ=1, each freq element is its own z-column.
+                spfft::GridFloat grid(cols, rows, 1, n_freq, SPFFT_PU_GPU, 0);
+                spfft::TransformFloat transform = grid.create_transform(
+                    SPFFT_PU_GPU, SPFFT_TRANS_R2C,
+                    cols, rows, 1, 1,
+                    n_freq, SPFFT_INDEX_TRIPLETS, indices.data());
+
+                // Fill SpFFT's internal GPU space-domain buffer via scatter kernel
+                float* d_space = transform.space_domain_data(SPFFT_PU_GPU);
+                cuda_check(cudaMemset(d_space, 0, (size_t)rows * cols * sizeof(float)));
+                spfft_scatter_kernel<<<(coo.nnz + 255) / 256, 256>>>(
+                    d_row, d_col, d_space, cols, coo.nnz);
+                cuda_check(cudaGetLastError());
+
+                // Output buffer on device for frequency elements
+                cuFloatComplex* d_freq = nullptr;
+                cuda_check(cudaMalloc(&d_freq, (size_t)n_freq * sizeof(cuFloatComplex)));
+
+                // Time forward transform N+1 times (1 warmup if N>1, then N timed).
+                cudaEvent_t t0, t1;
+                cuda_check(cudaEventCreate(&t0));
+                cuda_check(cudaEventCreate(&t1));
+
+                if (repeat_iters > 1) {
+                    transform.forward(SPFFT_PU_GPU, (float*)d_freq, SPFFT_NO_SCALING);
+                    cuda_check(cudaDeviceSynchronize());   // warmup
+                }
+                std::vector<float> times;
+                times.reserve(repeat_iters);
+                for (int it = 0; it < repeat_iters; it++) {
+                    cuda_check(cudaEventRecord(t0));
+                    transform.forward(SPFFT_PU_GPU, (float*)d_freq, SPFFT_NO_SCALING);
+                    cuda_check(cudaEventRecord(t1));
+                    cuda_check(cudaEventSynchronize(t1));
+                    float t = 0.0f;
+                    cuda_check(cudaEventElapsedTime(&t, t0, t1));
+                    times.push_back(t);
+                }
+                std::sort(times.begin(), times.end());
+                float ms     = times[repeat_iters / 2];
+                float min_ms = times.front();
+                float max_ms = times.back();
+
+                // Sample free memory at peak — captures SpFFT internal allocations
+                // (space-domain buffer, transpose scratch) plus our d_row/d_col/d_freq.
+                size_t peak_free = 0;
+                cudaMemGetInfo(&peak_free, &_tot);
+                size_t mem_bytes = (peak_free < base_free) ? base_free - peak_free : 0;
+
+                print_bench("SpFFT (baseline)", ms, mem_bytes,
+                            repeat_iters, min_ms, max_ms);
+
+                // Correctness vs dense_ref
+                if (dense_ref.available) {
+                    SparseFFTResult fake{};
+                    fake.d_output    = d_freq;
+                    fake.output_cols = cols / 2 + 1;
+                    print_check("SpFFT", dense_ref, fake);
+                    fake.d_output = nullptr; // prevent double-free
+                }
+
+                cudaFree(d_freq);
+                cudaFree(d_row);
+                cudaFree(d_col);
+                cudaEventDestroy(t0);
+                cudaEventDestroy(t1);
+
+            } catch (const std::exception& e) {
+                printf("%-26s  %10s  %12s  [%s]\n",
+                       "SpFFT (baseline)", "OOM", "OOM", e.what());
+                cudaGetLastError();
+            }
+        }
+#endif
+
+        // ===========================================================================
+        // HEADLINE — variant 3 of 4: CSC binary-sparse + custom radix-{2,3,9}
+        // Stockham mixed-radix Bluestein.  No cuFFT call anywhere.
+        // ===========================================================================
+        if (run_2pass && csc_mixed_radix) {
+            NvtxRange _range("Sparse CSC (mixed-radix)");
+            try {
+                float min_ms = 0, max_ms = 0;
+                SparseFFTResult sc = run_repeated<SparseFFTResult>(repeat_iters,
+                    [&] { return sparse_fft_csc_bluestein_mixed_radix(coo, csc_tile); },
+                    &min_ms, &max_ms);
+                print_bench("Sparse CSC (mixed-radix)", sc.ms, sc.mem_bytes,
+                            repeat_iters, min_ms, max_ms);
+                print_check("Sparse CSC mixed-radix", dense_ref, sc);
+                cudaFree(sc.d_output);
+            } catch (const std::exception& e) {
+                printf("%-26s  %10s  %12s  [%s]\n",
+                       "Sparse CSC (mixed-radix)", "OOM", "OOM", e.what());
+                cudaGetLastError();
+            }
+        }
+
+        // ===========================================================================
+        // HEADLINE — variant 4 of 4: CSC binary-sparse + cuFFT 1-D FFT at
+        // fft_len = next_7_smooth(2·cols−1).  Best-possible cuFFT data point.
+        // ===========================================================================
+        if (run_2pass && csc_cufft_smooth) {
+            NvtxRange _range("Sparse CSC (cuFFT smooth)");
+            try {
+                float min_ms = 0, max_ms = 0;
+                SparseFFTResult sc = run_repeated<SparseFFTResult>(repeat_iters,
+                    [&] { return sparse_fft_csc_bluestein_cufft_smooth(coo, csc_tile); },
+                    &min_ms, &max_ms);
+                print_bench("Sparse CSC (cufft smooth)", sc.ms, sc.mem_bytes,
+                            repeat_iters, min_ms, max_ms);
+                print_check("Sparse CSC cufft smooth", dense_ref, sc);
+                cudaFree(sc.d_output);
+            } catch (const std::exception& e) {
+                printf("%-26s  %10s  %12s  [%s]\n",
+                       "Sparse CSC (cufft smooth)", "OOM", "OOM", e.what());
+                cudaGetLastError();
+            }
+        }
+
+        // ===========================================================================
+        // DIAGNOSTIC — informational only; padded transform uses a different
+        // frequency grid so it cannot serve as a correctness reference.
+        // ===========================================================================
         // --- Dense cuFFT (padded to next 7-smooth size) ---
         if (dense_padded) {
             NvtxRange _range("Dense cuFFT (padded)");
             try {
-                DenseFFTResult dp = dense_fft_padded(coo);
+                float min_ms = 0, max_ms = 0;
+                DenseFFTResult dp = run_repeated<DenseFFTResult>(repeat_iters,
+                    [&] { return dense_fft_padded(coo); }, &min_ms, &max_ms);
                 char label[32];
                 snprintf(label, sizeof(label), "Dense cuFFT (%d²)", dp.padded_rows);
-                printf("%-26s  %10.3f  %12.2f  [NOTE: zero-padded, different freq grid]\n",
-                       label, dp.ms, dp.mem_bytes / 1e6);
+                if (repeat_iters > 1) {
+                    printf("%-26s  %10.3f  %12.2f  [min %.3f, max %.3f]  n=%d  [NOTE: zero-padded]\n",
+                           label, dp.ms, dp.mem_bytes / 1e6, min_ms, max_ms, repeat_iters);
+                } else {
+                    printf("%-26s  %10.3f  %12.2f  [NOTE: zero-padded, different freq grid]\n",
+                           label, dp.ms, dp.mem_bytes / 1e6);
+                }
                 check_padded_vs_dense(dp, dense_ref);
                 cudaFree(dp.d_output);
             } catch (const std::exception& e) {
@@ -282,6 +605,28 @@ int main(int argc, char** argv) {
                 cudaGetLastError();
             }
         }
+
+        // ===========================================================================
+        // EXPERIMENTAL / ABLATION VARIANTS — preserved for ablation studies but
+        // NOT part of the headline four-variant submission story.  Their
+        // implementations live in src/sparse_fft_*.cu and remain compiled in.
+        // Each block below is still callable via its individual --csc-* flag.
+        //
+        // Active flags in this section:
+        //   --csc-stockham-smem            (Stockham smem, radix-2 with smem fallback)
+        //   --csc-stockham-cufft           (Bluestein + cuFFT, non-streaming)
+        //   --csc-stockham-cufft-stream    (Bluestein + cuFFT, streaming — used for
+        //                                    pct20stif since headline #3 is non-streaming)
+        //   --csc-binary-lut               (binary byte-mask + LUT pass-1, cuFFT, streaming)
+        //   --csc-mixed-radix-graph        (#3 wrapped in a CUDA Graph)
+        //   --csc-binary-stockham-smem     (binary byte-mask + LUT pass-1, Stockham smem)
+        //
+        // Disabled blocks below (commented out): direct tiled DFT, COO 2-pass family,
+        // CSC 2-pass family (cached-W, tiled-p2, half-G), CSC streaming, the original
+        // Bluestein/Stockham non-cuFFT path, Stockham streaming, Stockham graph,
+        // CSR 2-pass.  Their kernel code is in src/sparse_fft_csc_2pass.cu /
+        // sparse_fft_coo_2pass.cu / sparse_fft_csr_2pass.cu / sparse_fft_direct_dft.cu.
+        // ===========================================================================
 
         // --- Sparse FFT: tiled direct DFT ---
         // if (run_sparse) {
@@ -462,9 +807,12 @@ int main(int argc, char** argv) {
         if (run_2pass && csc_stockham_smem) {
             NvtxRange _range("Sparse CSC (Stockham smem)");
             try {
-                SparseFFTResult ss = sparse_fft_csc_bluestein_smem(coo, csc_tile);
-                printf("%-26s  %10.3f  %12.2f\n",
-                       "Sparse CSC (Stk smem)", ss.ms, ss.mem_bytes / 1e6);
+                float min_ms = 0, max_ms = 0;
+                SparseFFTResult ss = run_repeated<SparseFFTResult>(repeat_iters,
+                    [&] { return sparse_fft_csc_bluestein_smem(coo, csc_tile); },
+                    &min_ms, &max_ms);
+                print_bench("Sparse CSC (Stk smem)", ss.ms, ss.mem_bytes,
+                            repeat_iters, min_ms, max_ms);
                 print_check("Sparse CSC Stk smem", dense_ref, ss);
                 cudaFree(ss.d_output);
             } catch (const std::exception& e) {
@@ -478,9 +826,12 @@ int main(int argc, char** argv) {
         if (run_2pass && csc_stockham_cufft) {
             NvtxRange _range("Sparse CSC (Bluestein+cuFFT)");
             try {
-                SparseFFTResult sc = sparse_fft_csc_bluestein_cufft(coo, csc_tile);
-                printf("%-26s  %10.3f  %12.2f\n",
-                       "Sparse CSC (Bluestein+cufft)", sc.ms, sc.mem_bytes / 1e6);
+                float min_ms = 0, max_ms = 0;
+                SparseFFTResult sc = run_repeated<SparseFFTResult>(repeat_iters,
+                    [&] { return sparse_fft_csc_bluestein_cufft(coo, csc_tile); },
+                    &min_ms, &max_ms);
+                print_bench("Sparse CSC (Bluestein+cufft)", sc.ms, sc.mem_bytes,
+                            repeat_iters, min_ms, max_ms);
                 print_check("Sparse CSC Bluestein+cufft", dense_ref, sc);
                 cudaFree(sc.d_output);
             } catch (const std::exception& e) {
@@ -509,14 +860,73 @@ int main(int argc, char** argv) {
         if (run_2pass && csc_stockham_cufft_stream) {
             NvtxRange _range("Sparse CSC (Bluestein+cuFFT stream)");
             try {
-                SparseFFTResult sc = sparse_fft_csc_bluestein_cufft_streaming(coo, csc_tile);
-                printf("%-26s  %10.3f  %12.2f\n",
-                       "Sparse CSC (cufft stream)", sc.ms, sc.mem_bytes / 1e6);
+                float min_ms = 0, max_ms = 0;
+                SparseFFTResult sc = run_repeated<SparseFFTResult>(repeat_iters,
+                    [&] { return sparse_fft_csc_bluestein_cufft_streaming(coo, csc_tile); },
+                    &min_ms, &max_ms);
+                print_bench("Sparse CSC (cufft stream)", sc.ms, sc.mem_bytes,
+                            repeat_iters, min_ms, max_ms);
                 print_check("Sparse CSC cufft stream", dense_ref, sc);
             } catch (const std::exception& e) {
                 printf("%-26s  %10s  %12s  [%s]\n",
                        "Sparse CSC (cufft stream)", "OOM", "OOM", e.what());
             cudaGetLastError();  // clear sticky device error for next benchmark
+            }
+        }
+
+        // --- Sparse FFT: experimental binary CSC + byte-mask LUT pass-1 + cuFFT (streaming) ---
+        if (run_2pass && csc_binary_lut) {
+            NvtxRange _range("Sparse CSC (binary LUT)");
+            try {
+                float min_ms = 0, max_ms = 0;
+                SparseFFTResult sc = run_repeated<SparseFFTResult>(repeat_iters,
+                    [&] { return sparse_fft_csc_bluestein_binary_lut(coo, csc_tile); },
+                    &min_ms, &max_ms);
+                print_bench("Sparse CSC (binary LUT)", sc.ms, sc.mem_bytes,
+                            repeat_iters, min_ms, max_ms);
+                print_check("Sparse CSC binary LUT", dense_ref, sc);
+            } catch (const std::exception& e) {
+                printf("%-26s  %10s  %12s  [%s]\n",
+                       "Sparse CSC (binary LUT)", "OOM", "OOM", e.what());
+                cudaGetLastError();
+            }
+        }
+
+        // --- Sparse FFT: mixed-radix Bluestein with CUDA Graph capture/replay ---
+        if (run_2pass && csc_mixed_radix_graph) {
+            NvtxRange _range("Sparse CSC (mixed-radix graph)");
+            try {
+                float min_ms = 0, max_ms = 0;
+                SparseFFTResult sc = run_repeated<SparseFFTResult>(repeat_iters,
+                    [&] { return sparse_fft_csc_bluestein_mixed_radix_graph(coo, csc_tile); },
+                    &min_ms, &max_ms);
+                print_bench("Sparse CSC (mr-graph)", sc.ms, sc.mem_bytes,
+                            repeat_iters, min_ms, max_ms);
+                print_check("Sparse CSC mr-graph", dense_ref, sc);
+                cudaFree(sc.d_output);
+            } catch (const std::exception& e) {
+                printf("%-26s  %10s  %12s  [%s]\n",
+                       "Sparse CSC (mr-graph)", "OOM", "OOM", e.what());
+                cudaGetLastError();
+            }
+        }
+
+        // --- Sparse FFT: experimental binary CSC + byte-mask LUT + Stockham smem (non-streaming) ---
+        if (run_2pass && csc_binary_stockham_smem) {
+            NvtxRange _range("Sparse CSC (binary Stk smem)");
+            try {
+                float min_ms = 0, max_ms = 0;
+                SparseFFTResult sc = run_repeated<SparseFFTResult>(repeat_iters,
+                    [&] { return sparse_fft_csc_stockham_binary_smem(coo, csc_tile); },
+                    &min_ms, &max_ms);
+                print_bench("Sparse CSC (binary Stk smem)", sc.ms, sc.mem_bytes,
+                            repeat_iters, min_ms, max_ms);
+                print_check("Sparse CSC binary Stk smem", dense_ref, sc);
+                cudaFree(sc.d_output);
+            } catch (const std::exception& e) {
+                printf("%-26s  %10s  %12s  [%s]\n",
+                       "Sparse CSC (binary Stk smem)", "OOM", "OOM", e.what());
+                cudaGetLastError();
             }
         }
 
@@ -549,95 +959,6 @@ int main(int argc, char** argv) {
         //                "Sparse CSR (2-pass)", "OOM", "OOM", e.what());
         //     }
         // }
-
-#ifdef HAS_SPFFT
-        // --- SpFFT GPU baseline (dense-input, all R2C frequency elements) ---
-        if (run_spfft) {
-            NvtxRange _range("SpFFT (baseline)");
-            try {
-                const int rows = coo.rows, cols = coo.cols;
-                const int n_freq = rows * (cols / 2 + 1);
-
-                // Upload COO indices to device
-                int *d_row = nullptr, *d_col = nullptr;
-                cuda_check(cudaMalloc(&d_row, (size_t)coo.nnz * sizeof(int)));
-                cuda_check(cudaMalloc(&d_col, (size_t)coo.nnz * sizeof(int)));
-                cuda_check(cudaMemcpy(d_row, coo.row_idx.data(),
-                    (size_t)coo.nnz * sizeof(int), cudaMemcpyHostToDevice));
-                cuda_check(cudaMemcpy(d_col, coo.col_idx.data(),
-                    (size_t)coo.nnz * sizeof(int), cudaMemcpyHostToDevice));
-
-                // Build R2C frequency triplets (x, y, 0): x=0..cols/2, y=0..rows-1
-                // y-outer / x-inner → row-major layout matching cuFFT R2C output
-                std::vector<int> indices;
-                indices.reserve((size_t)n_freq * 3);
-                for (int y = 0; y < rows; ++y)
-                    for (int x = 0; x <= cols / 2; ++x) {
-                        indices.push_back(x);
-                        indices.push_back(y);
-                        indices.push_back(0);
-                    }
-
-                // Create SpFFT Grid (single-precision float, 2D via dimZ=1).
-                // maxNumLocalZColumns = n_freq: for dimZ=1, each freq element is its own z-column.
-                spfft::GridFloat grid(cols, rows, 1, n_freq, SPFFT_PU_GPU, 0);
-                spfft::TransformFloat transform = grid.create_transform(
-                    SPFFT_PU_GPU, SPFFT_TRANS_R2C,
-                    cols, rows, 1, 1,
-                    n_freq, SPFFT_INDEX_TRIPLETS, indices.data());
-
-                // Fill SpFFT's internal GPU space-domain buffer via scatter kernel
-                float* d_space = transform.space_domain_data(SPFFT_PU_GPU);
-                cuda_check(cudaMemset(d_space, 0, (size_t)rows * cols * sizeof(float)));
-                spfft_scatter_kernel<<<(coo.nnz + 255) / 256, 256>>>(
-                    d_row, d_col, d_space, cols, coo.nnz);
-                cuda_check(cudaGetLastError());
-
-                // Output buffer on device for frequency elements
-                cuFloatComplex* d_freq = nullptr;
-                cuda_check(cudaMalloc(&d_freq, (size_t)n_freq * sizeof(cuFloatComplex)));
-
-                // Memory: SpFFT space-domain buffer (internal) + freq output + COO indices
-                // SpFFT allocates rows*cols floats internally for the space domain.
-                size_t mem_bytes = (size_t)rows * cols * sizeof(float)
-                                 + (size_t)n_freq * sizeof(cuFloatComplex)
-                                 + (size_t)coo.nnz * 2 * sizeof(int);
-
-                // Time forward transform only (space → frequency)
-                cudaEvent_t t0, t1;
-                cuda_check(cudaEventCreate(&t0));
-                cuda_check(cudaEventCreate(&t1));
-                cuda_check(cudaEventRecord(t0));
-                transform.forward(SPFFT_PU_GPU, (float*)d_freq, SPFFT_NO_SCALING);
-                cuda_check(cudaEventRecord(t1));
-                cuda_check(cudaEventSynchronize(t1));
-                float ms = 0.0f;
-                cuda_check(cudaEventElapsedTime(&ms, t0, t1));
-
-                printf("%-26s  %10.3f  %12.2f\n", "SpFFT (baseline)", ms, mem_bytes / 1e6);
-
-                // Correctness vs dense_ref
-                if (dense_ref.available) {
-                    SparseFFTResult fake{};
-                    fake.d_output    = d_freq;
-                    fake.output_cols = cols / 2 + 1;
-                    print_check("SpFFT", dense_ref, fake);
-                    fake.d_output = nullptr; // prevent double-free
-                }
-
-                cudaFree(d_freq);
-                cudaFree(d_row);
-                cudaFree(d_col);
-                cudaEventDestroy(t0);
-                cudaEventDestroy(t1);
-
-            } catch (const std::exception& e) {
-                printf("%-26s  %10s  %12s  [%s]\n",
-                       "SpFFT (baseline)", "OOM", "OOM", e.what());
-                cudaGetLastError();
-            }
-        }
-#endif
 
         printf("\n");
 

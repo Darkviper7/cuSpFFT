@@ -51,3 +51,25 @@ if(ENABLE_SPFFT)
     target_compile_definitions(cuSpFFT PRIVATE HAS_SPFFT)
     target_link_libraries(cuSpFFT PRIVATE SpFFT::spfft)
 endif()
+
+# Optional CPU reference baseline using FFTW3 single-precision.
+# Provides an independent CPU ground-truth FFT for correctness-checking every
+# CUDA variant (dense cuFFT, SpFFT, sparse paths).  Especially useful when the
+# GPU dense baseline cannot run (e.g. pct20stif).
+option(ENABLE_CPU_REFERENCE "Build CPU FFT reference using FFTW3 single-precision" OFF)
+if(ENABLE_CPU_REFERENCE)
+    find_path(FFTW3F_INCLUDE_DIR fftw3.h
+        HINTS $ENV{HOME}/local/include /usr/local/include /usr/include)
+    find_library(FFTW3F_LIBRARY fftw3f
+        HINTS $ENV{HOME}/local/lib /usr/local/lib /usr/lib /usr/lib/x86_64-linux-gnu)
+    if(NOT FFTW3F_INCLUDE_DIR OR NOT FFTW3F_LIBRARY)
+        message(FATAL_ERROR
+            "ENABLE_CPU_REFERENCE=ON but FFTW3 single-precision not found. "
+            "Install fftw-3.x with --enable-float and pass -DCMAKE_PREFIX_PATH "
+            "to point at its install prefix.")
+    endif()
+    target_sources(cuSpFFT PRIVATE src/cpu_reference.cpp)
+    target_include_directories(cuSpFFT PRIVATE ${FFTW3F_INCLUDE_DIR})
+    target_link_libraries(cuSpFFT PRIVATE ${FFTW3F_LIBRARY})
+    target_compile_definitions(cuSpFFT PRIVATE HAS_CPU_REF)
+endif()
