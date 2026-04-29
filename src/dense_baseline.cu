@@ -20,18 +20,6 @@
                                      std::to_string(r));                     \
     } while (0)
 
-// Returns the smallest 7-smooth number (factors only from {2,3,5,7}) >= n.
-// Used to find a cuFFT-friendly padded transform size for matrices whose
-// dimensions contain large prime factors (e.g. 52329 = 3 × 17443).
-static int next_smooth(int n) {
-    for (int m = n; ; ++m) {
-        int x = m;
-        for (int p : {2, 3, 5, 7})
-            while (x % p == 0) x /= p;
-        if (x == 1) return m;
-    }
-}
-
 // Kernel: scatter COO entries into a dense float array (value = 1.0f).
 // Index must use 64-bit arithmetic: for large matrices (rows > ~46k) the product
 // row * cols overflows int32, causing out-of-bounds writes and hardware errors.
@@ -138,102 +126,6 @@ DenseFFTResult dense_fft(const COOMatrix& coo) {
         if (t0) cudaEventDestroy(t0);
         if (t1) cudaEventDestroy(t1);
         cudaGetLastError();  // consume + clear sticky device error
-        throw;
-    }
-}
-
-DenseFFTResult dense_fft_padded(const COOMatrix& coo) {
-    const int rows  = coo.rows;
-    const int cols  = coo.cols;
-    const int prows = next_smooth(rows);
-    const int pcols = next_smooth(cols);
-
-    // In-place R2C: a single buffer serves as both real input and complex output.
-    // cuFFT requires each row to be padded to inembed = 2*(pcols/2+1) floats so
-    // the complex output (pcols/2+1 values) fits in the same row allocation.
-    // This halves peak memory vs out-of-place (one ~11 GB buffer instead of two).
-    const int    inembed    = 2 * (pcols / 2 + 1);
-    const size_t buf_floats = (size_t)prows * inembed;
-
-    size_t base_free = 0, _tot = 0;
-    cudaMemGetInfo(&base_free, &_tot);
-    size_t peak = 0;
-
-    int *d_row = nullptr, *d_col = nullptr;
-    float* d_buf = nullptr;
-    cufftHandle plan = 0;
-    cudaEvent_t t0 = nullptr, t1 = nullptr;
-
-    try {
-        CUDA_CHECK(cudaMalloc(&d_row, coo.nnz * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_col, coo.nnz * sizeof(int)));
-        CUDA_CHECK(cudaMemcpy(d_row, coo.row_idx.data(), coo.nnz * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_col, coo.col_idx.data(), coo.nnz * sizeof(int), cudaMemcpyHostToDevice));
-
-        CUDA_CHECK(cudaMalloc(&d_buf, buf_floats * sizeof(float)));
-        CUDA_CHECK(cudaMemset(d_buf, 0, buf_floats * sizeof(float)));
-
-        // Scatter with stride inembed (not pcols) so real values land in the
-        // first pcols slots of each row; the trailing 2 padding floats remain 0.
-        int threads = 256;
-        int blocks  = (coo.nnz + threads - 1) / threads;
-        coo_to_dense<<<blocks, threads>>>(d_row, d_col, d_buf, inembed, coo.nnz);
-        CUDA_CHECK(cudaGetLastError());
-
-        cudaFree(d_row);  d_row = nullptr;
-        cudaFree(d_col);  d_col = nullptr;
-
-        CUFFT_CHECK(cufftPlan2d(&plan, prows, pcols, CUFFT_R2C));
-
-        {
-            size_t ws = 0, free_mem = 0, total_mem = 0;
-            CUFFT_CHECK(cufftGetSize(plan, &ws));
-            CUDA_CHECK(cudaMemGetInfo(&free_mem, &total_mem));
-            if (ws > free_mem)
-                throw std::runtime_error(
-                    "CUDA error: out of memory (cuFFT workspace needs " +
-                    std::to_string(ws >> 20) + " MB, only " +
-                    std::to_string(free_mem >> 20) + " MB free)");
-        }
-
-        CUDA_CHECK(cudaEventCreate(&t0));
-        CUDA_CHECK(cudaEventCreate(&t1));
-        CUDA_CHECK(cudaEventRecord(t0));
-
-        // In-place: same pointer for real input and complex output.
-        CUFFT_CHECK(cufftExecR2C(plan, (cufftReal*)d_buf, (cufftComplex*)d_buf));
-        CUDA_CHECK(cudaDeviceSynchronize());
-        CUDA_CHECK(cudaEventRecord(t1));
-        CUDA_CHECK(cudaEventSynchronize(t1));
-
-        float ms = 0.f;
-        CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
-
-        size_t peak_free = 0;
-        cudaMemGetInfo(&peak_free, &_tot);
-        peak = (peak_free < base_free) ? base_free - peak_free : 0;
-
-        cudaEventDestroy(t0);
-        cudaEventDestroy(t1);
-        cufftDestroy(plan);
-
-        // d_buf now holds the complex R2C output; caller must cudaFree it.
-        DenseFFTResult result;
-        result.d_output    = (cuFloatComplex*)d_buf;
-        result.ms          = ms;
-        result.mem_bytes   = peak;
-        result.padded_rows = prows;
-        result.padded_cols = pcols;
-        return result;
-
-    } catch (...) {
-        cudaFree(d_row);
-        cudaFree(d_col);
-        cudaFree(d_buf);
-        if (plan) cufftDestroy(plan);
-        if (t0) cudaEventDestroy(t0);
-        if (t1) cudaEventDestroy(t1);
-        cudaGetLastError();
         throw;
     }
 }

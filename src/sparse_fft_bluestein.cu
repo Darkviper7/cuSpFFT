@@ -4,8 +4,6 @@
 #include <cstdio>
 
 // Tracks peak device memory used between construction and finish().
-// finish() must be called BEFORE any cudaFree of buffers allocated during the
-// run, otherwise we'd undercount the high-water mark.
 struct DeviceMemPeak {
     size_t base_free = 0;
     DeviceMemPeak() {
@@ -21,10 +19,7 @@ struct DeviceMemPeak {
     }
 };
 
-// ---------------------------------------------------------------------------
-// FFT kernel infrastructure (private to this TU)
-// bit_reverse, fft_stage, scale_complex, all Stockham variants, pointwise_mul
-// ---------------------------------------------------------------------------
+
 __device__ __forceinline__ unsigned bit_reverse_u32(unsigned x, int bits) {
     x = ((x & 0x55555555u) << 1) | ((x >> 1) & 0x55555555u);
     x = ((x & 0x33333333u) << 2) | ((x >> 2) & 0x33333333u);
@@ -85,19 +80,13 @@ __global__ void scale_complex_kernel(cuFloatComplex* data, int total, float scal
 }
 
 // ---------------------------------------------------------------------------
-// Improvement 2: Shared-memory Stockham FFT (one block per row)
+// Per-stage FFT kernel launchers Shared-memory Stockham FFT (one block per row)
 //
-// When 2 * fft_len * 8 bytes fits in shared memory (≤ SMEM_MAX_FFT_N = 4096),
+// When 2 * fft_len * 8 bytes fits in shared memory
 // load the entire row into smem ping-pong buffers and do ALL butterfly stages
-// there.  This replaces log2(n) global-memory round-trips with a single
-// global load + single global store — a log2(n)× reduction in DRAM traffic
-// (11× for fft_len=2048, 12× for fft_len=4096).
-//
-// Applicable to sstmodel (fft_len = 2048).  Falls back to the per-stage stream
-// variant for larger fft_len (benzene/pct20stif).
+// there. 
 // ---------------------------------------------------------------------------
 // In-place: reads from inout into smem ping-pong, runs all stages, writes back.
-// d_tmp is not touched; can be nullptr for smem path.
 __global__ void stockham_smem_row_kernel(
     cuFloatComplex* __restrict__ inout,
     int n, int batch, int inverse)
@@ -144,9 +133,7 @@ __global__ void stockham_smem_row_kernel(
         inout[(size_t)row * n + i] = src[i];
 }
 
-// Mul-inverse variant: pre-multiplies each element by mul[i % n] (the B_fft
-// pointwise factor) before the IFFT.  Mathematically equivalent to fusing the
-// multiply into the first butterfly stage, but implemented as a single smem pass.
+// Stockham FFT, row-major, in-place, out-of-place, batched, with shared memory
 __global__ void stockham_smem_row_mul_inverse_kernel(
     cuFloatComplex* __restrict__ inout,
     const cuFloatComplex* __restrict__ mul,
@@ -158,10 +145,6 @@ __global__ void stockham_smem_row_mul_inverse_kernel(
 
     cuFloatComplex* sa = smem, *sb = smem + n;
 
-    // Load and pre-multiply by B_fft element-wise (all n positions).
-    // This is equivalent to what stockham_stage_mul_kernel does at l=1, m=n/2:
-    // in0=k, in1=k+n/2 covers all [0,n), so pre-multiplying all elements first
-    // then running the regular butterfly gives identical results.
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         cuFloatComplex x = inout[(size_t)row * n + i];
         cuFloatComplex m = mul[i];
@@ -346,7 +329,7 @@ __global__ void pointwise_mul_batched_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Bluestein input build kernels: 1-D layout (active fast path)
+// Bluestein input build kernels: 1-D layout 
 // ---------------------------------------------------------------------------
 __global__ void csc_build_bluestein_input_kernel(
     const int* __restrict__ col_ptr,
@@ -414,7 +397,7 @@ __global__ void csc_build_bluestein_input_packed_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Bluestein input build kernels: 2-D coalesced layout (alternative variant)
+// Bluestein input build kernels: 2-D coalesced layout
 // ---------------------------------------------------------------------------
 __global__ void csc_build_bluestein_input_coalesced_kernel(
     const int* __restrict__ col_ptr,
@@ -503,7 +486,7 @@ __global__ void bluestein_finalize_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Stockham FFT host helpers (private to this TU)
+// Stockham FFT host helpers 
 // ---------------------------------------------------------------------------
 static void run_fft_power2(cuFloatComplex* d_in,
                            cuFloatComplex* d_tmp,
@@ -572,7 +555,7 @@ static void run_fft_power2_stockham(cuFloatComplex* d_in,
 }
 
 // Returns pointer to whichever buffer (d_in or d_tmp) holds the FFT result,
-// eliminating the D2D copy needed when the stage count is odd.
+// after performing the FFT.
 static cuFloatComplex* run_fft_power2_stockham_stream(cuFloatComplex* d_in,
                                                       cuFloatComplex* d_tmp,
                                                       int n, int batch, bool inverse,
@@ -659,12 +642,9 @@ static cuFloatComplex* run_fft_power2_stockham_mul_inverse_stream(
     return src;
 }
 
-// ---------------------------------------------------------------------------
-// Improvement 2 host runners — smem path
-//
+
 // Returns d_in (in-place).  When fft_len > SMEM_MAX_FFT_N the call transparently
 // falls back to the per-stage stream variant so callers need not branch.
-// ---------------------------------------------------------------------------
 static cuFloatComplex* run_fft_power2_stockham_smem_stream(
     cuFloatComplex* d_in, cuFloatComplex* d_tmp,
     int n, int batch, bool inverse, cudaStream_t stream)
@@ -843,9 +823,7 @@ SparseFFTResult sparse_fft_csc_bluestein(const COOMatrix& coo, int u_tile,
         cuFloatComplex* conv_result;
         if (use_stockham) {
             if (fft_backend == 1) {
-                // smem row kernel — entire FFT in shared memory (improvement 2).
-                // In-place on d_signal; d_work is ping-pong scratch (may be unused
-                // if smem path activates, used as fallback otherwise).
+                // smem row kernel — entire FFT in shared memory 
                 cuFloatComplex* fwd = run_fft_power2_stockham_smem_stream(
                     d_signal, d_work, fft_len, tile_rows, false, 0);
                 cuFloatComplex* fwd_other = (fwd == d_signal) ? d_work : d_signal;
@@ -1065,7 +1043,6 @@ SparseFFTResult sparse_fft_csc_stockham_streaming(const COOMatrix& coo, int u_ti
         const int buf = (u_base / u_tile) & 1;
         const size_t signal_bytes = (size_t)tile_rows * fft_len * sizeof(cuFloatComplex);
 
-        // Don't overwrite d_out_chunk[buf] until its in-flight D2H (if any) is done.
         CUDA_CHECK(cudaStreamWaitEvent(compute_stream, d2h_done[buf]));
 
         CUDA_CHECK(cudaMemsetAsync(d_signal, 0, signal_bytes, compute_stream));
@@ -1173,7 +1150,7 @@ SparseFFTResult sparse_fft_csc_bluestein_cufft_streaming(const COOMatrix& coo, i
 
 
 // ---------------------------------------------------------------------------
-// CUDA Graph variant (same Bluestein kernel family)
+// CUDA Graph variant + Bluestein
 // ---------------------------------------------------------------------------
 SparseFFTResult sparse_fft_csc_stockham_graph(const COOMatrix& coo, int u_tile) {
     const int rows = coo.rows;
@@ -1320,7 +1297,7 @@ SparseFFTResult sparse_fft_csc_stockham_graph(const COOMatrix& coo, int u_tile) 
 
 
 // ===========================================================================
-// Experimental: binary CSC + byte-mask LUT pass-1 + cuFFT Bluestein streaming
+// binary CSC + byte-mask LUT pass-1 + cuFFT Bluestein streaming
 //
 // Pass-1 cost in the existing cuFFT-streaming path is dominated by sincosf:
 // one call per (nonzero, u_local) pair — i.e. nnz × tile_rows × num_tiles.
@@ -1762,7 +1739,7 @@ SparseFFTResult sparse_fft_csc_bluestein_binary_lut(const COOMatrix& coo, int u_
 
 
 // ===========================================================================
-// Experimental: binary CSC + byte-mask LUT pass-1 + Stockham smem (NON-streaming)
+// : binary CSC + byte-mask LUT pass-1 + Stockham smem (NON-streaming)
 //
 // Same pass-1 as sparse_fft_csc_bluestein_binary_lut, but Bluestein convolution
 // runs through run_fft_power2_stockham_smem_stream (which auto-falls-back to the
@@ -1770,7 +1747,6 @@ SparseFFTResult sparse_fft_csc_bluestein_binary_lut(const COOMatrix& coo, int u_
 // stockham_smem_row_mul_inverse_kernel — no cuFFT anywhere.  Allocates the full
 // d_out = rows × output_stride on device.
 //
-// Set CUSPFFT_BREAKDOWN=1 in the environment to enable per-phase timing.
 // ===========================================================================
 
 static bool stockham_binary_breakdown_enabled() {
@@ -1992,13 +1968,7 @@ SparseFFTResult sparse_fft_csc_stockham_binary_smem(const COOMatrix& coo, int u_
 
 
 // ===========================================================================
-// Experimental: mixed-radix {2, 3} Stockham FFT for Bluestein convolution.
-//
-// Drops the next_pow2(2·cols−1) requirement of the existing Stockham path —
-// uses next_3_smooth(2·cols−1) instead, which is ~0.56× the size for benzene
-// (18432 vs 32768) so the Bluestein FFT itself does proportionally less work.
-// Combined with the binary CSC pass-1 (no values, packed indices), this aims
-// to beat dense cuFFT WITHOUT calling cuFFT anywhere.
+// : mixed-radix {2, 3} Stockham FFT for Bluestein convolution.
 // ===========================================================================
 
 // Smallest 3-smooth integer ≥ n (factors only from {2, 3}).
@@ -2580,10 +2550,8 @@ SparseFFTResult sparse_fft_csc_bluestein_mixed_radix_graph(const COOMatrix& coo,
 
 
 // ===========================================================================
-// "Best-possible cuFFT" baseline: same Bluestein scaffolding as the existing
-// cuFFT path, but with fft_len = next_7_smooth(2·cols−1) instead of next_pow2.
-// For benzene that's 16464 vs 32768 — exactly half the work — and cuFFT
-// handles 7-smooth sizes natively via its own internal mixed-radix.
+// same Bluestein scaffolding as the existing
+// cuFFT path, but with fft_len = next_7_smooth(2·cols−1)
 // Non-streaming; allocates full d_out.
 // ===========================================================================
 SparseFFTResult sparse_fft_csc_bluestein_cufft_smooth(const COOMatrix& coo, int u_tile) {

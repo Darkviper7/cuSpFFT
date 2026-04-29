@@ -32,8 +32,7 @@ CPUReferenceResult cpu_fft_r2c_2d(const COOMatrix& coo) {
         in[(size_t)r * (size_t)cols + (size_t)c] = 1.0f;
     }
 
-    // Plan + execute. FFTW_ESTIMATE keeps planning cheap; FFTW_MEASURE would
-    // tune kernels but takes seconds and isn't worth it for a one-shot reference.
+    // Plan + execute.
     fftwf_plan plan = fftwf_plan_dft_r2c_2d(rows, cols, in, out, FFTW_ESTIMATE);
     if (!plan) {
         fftwf_free(in);
@@ -48,7 +47,7 @@ CPUReferenceResult cpu_fft_r2c_2d(const COOMatrix& coo) {
     fftwf_destroy_plan(plan);
 
     // fftwf_complex is binary-compatible with cuFloatComplex (both are
-    // {float real, float imag}).  std::memcpy is safe.
+    // {float real, float imag}).
     CPUReferenceResult result;
     result.output.resize(out_size);
     std::memcpy(result.output.data(), out, out_size * sizeof(fftwf_complex));

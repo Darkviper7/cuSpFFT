@@ -131,7 +131,7 @@ static DenseReference make_cpu_reference(CPUReferenceResult&& cpu, int cols) {
 #endif
 
 // Compare a dense d_output against the host reference.  Used for dense cuFFT
-// and dense-padded checks when the reference comes from a CPU FFT.
+// when the reference comes from a CPU FFT.
 static CheckStats compare_dense_to_ref(const DenseReference& ref,
                                         const DenseFFTResult& dense) {
     std::vector<cuFloatComplex> h_dense((size_t)ref.rows * ref.freq_cols);
@@ -214,56 +214,12 @@ static void print_check(const char* method, const DenseReference& ref,
            method, s.max_abs, s.max_rel, s.rms_abs);
 }
 
-// Compare dense-padded output against the exact dense reference.
-// Copies the top-left ref.rows × ref.freq_cols corner of the padded output
-// (which has stride padded_cols/2+1 complex values per row) and computes
-// error stats.  Errors will be non-zero because the padded transform uses
-// a different frequency grid (k/pcols vs k/cols).
-static void check_padded_vs_dense(const DenseFFTResult& padded,
-                                   const DenseReference& ref) {
-    if (!ref.available) return;
-
-    const int pcols_half = padded.padded_cols / 2 + 1;
-    std::vector<cuFloatComplex> h_pad((size_t)ref.rows * ref.freq_cols);
-    cuda_check(cudaMemcpy2D(
-        h_pad.data(),
-        (size_t)ref.freq_cols * sizeof(cuFloatComplex),
-        padded.d_output,
-        (size_t)pcols_half * sizeof(cuFloatComplex),
-        (size_t)ref.freq_cols * sizeof(cuFloatComplex),
-        ref.rows,
-        cudaMemcpyDeviceToHost));
-
-    CheckStats s;
-    double sum_sq = 0.0;
-    const size_t n = h_pad.size();
-    for (size_t i = 0; i < n; i++) {
-        const double dx = (double)h_pad[i].x - (double)ref.h_freq[i].x;
-        const double dy = (double)h_pad[i].y - (double)ref.h_freq[i].y;
-        const double abs_err = std::sqrt(dx*dx + dy*dy);
-        const double ref_mag = std::sqrt((double)ref.h_freq[i].x * ref.h_freq[i].x
-                                       + (double)ref.h_freq[i].y * ref.h_freq[i].y);
-        s.max_abs = std::max(s.max_abs, abs_err);
-        s.max_rel = std::max(s.max_rel, abs_err / std::max(1.0, ref_mag));
-        sum_sq += abs_err * abs_err;
-    }
-    s.rms_abs = std::sqrt(sum_sq / (double)n);
-    printf("  check %-19s  max_abs %.3e  max_rel %.3e  rms_abs %.3e\n",
-           "Dense padded", s.max_abs, s.max_rel, s.rms_abs);
-}
-
 static void print_usage(const char* prog) {
     fprintf(stderr,
         "Usage: %s <matrix.mtx> [options]\n"
         "Options:\n"
         "  --sparse-only    Skip dense cuFFT baseline\n"
         "  --dense-only     Skip sparse FFT methods\n"
-        "  --no-2pass       Skip two-pass sparse FFT (COO and CSR)\n"
-        "  --gemm-tf32      Use TF32 Tensor Core math for cuBLAS GEMM comparison\n"
-        "  --csc-cache-w    Add CSC variant that caches column twiddles W\n"
-        "  --csc-tiled-p2   Add CSC variant with shared G/W tiled pass 2\n"
-        "  --csc-half-g     Add tiled CSC variant storing G_chunk as half2\n"
-        "  --csc-stream     Add tiled CSC variant streaming output chunks to host\n"
         "  --csc-bluestein  Add CSC variant with custom Bluestein FFT pass 2\n"
         "  --csc-stockham   Use Stockham FFT backend for CSC Bluestein variant\n"
         "  --csc-stockham-smem   Add CSC Stockham variant with smem row FFT (improvement 2)\n"
@@ -271,7 +227,6 @@ static void print_usage(const char* prog) {
         "  --csc-stockham-stream  Add double-buffered streaming Stockham variant\n"
         "  --csc-stockham-cufft-stream  Add streaming variant using cuFFT C2C backend (minimal device memory)\n"
         "  --csc-stockham-graph   Add CUDA Graph replay Stockham variant\n"
-        "  --dense-padded   Add dense cuFFT on zero-padded 7-smooth size (timing only, different freq grid)\n"
         "  --csc-tile N     Output-row tile size for chunked CSC (default: 1024)\n"
         "  --spfft          SpFFT GPU baseline (requires HAS_SPFFT build)\n"
         "  --csc-binary-lut Experimental binary-CSC byte-mask + LUT pass-1 + cuFFT (streaming)\n"
@@ -293,16 +248,14 @@ static void print_separator() {
 
 int main(int argc, char** argv) {
     if (argc < 2) { print_usage(argv[0]); return 1; }
+    if (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h") {
+        print_usage(argv[0]);
+        return 0;
+    }
 
     bool run_dense   = true;
     bool run_sparse  = true;
     bool run_2pass   = true;
-    bool run_csr     = true;
-    bool gemm_tf32   = false;
-    bool csc_cache_w = false;
-    bool csc_tiled_p2 = false;
-    bool csc_half_g  = false;
-    bool csc_stream  = false;
     bool csc_bluestein = false;
     bool csc_stockham = false;
     bool csc_stockham_smem = false;
@@ -310,7 +263,6 @@ int main(int argc, char** argv) {
     bool csc_stockham_stream = false;
     bool csc_stockham_cufft_stream = false;
     bool csc_stockham_graph = false;
-    bool dense_padded = false;
     bool run_spfft    = false;
     bool csc_binary_lut = false;
     bool csc_binary_stockham_smem = false;
@@ -324,14 +276,7 @@ int main(int argc, char** argv) {
     for (int i = 2; i < argc; i++) {
         std::string f(argv[i]);
         if      (f == "--sparse-only") run_dense  = false;
-        else if (f == "--dense-only")  { run_sparse = false; run_2pass = false; run_csr = false; }
-        else if (f == "--no-2pass")    { run_2pass  = false; run_csr   = false; }
-        else if (f == "--no-csr")      run_csr    = false;
-        else if (f == "--gemm-tf32")   gemm_tf32  = true;
-        else if (f == "--csc-cache-w") csc_cache_w = true;
-        else if (f == "--csc-tiled-p2") csc_tiled_p2 = true;
-        else if (f == "--csc-half-g")  csc_half_g = true;
-        else if (f == "--csc-stream")  csc_stream = true;
+        else if (f == "--dense-only")  { run_sparse = false; run_2pass = false; }
         else if (f == "--csc-bluestein") csc_bluestein = true;
         else if (f == "--csc-stockham") csc_stockham = true;
         else if (f == "--csc-stockham-smem") csc_stockham_smem = true;
@@ -339,7 +284,6 @@ int main(int argc, char** argv) {
         else if (f == "--csc-stockham-stream") csc_stockham_stream = true;
         else if (f == "--csc-stockham-cufft-stream") csc_stockham_cufft_stream = true;
         else if (f == "--csc-stockham-graph") csc_stockham_graph = true;
-        else if (f == "--dense-padded") dense_padded = true;
         else if (f == "--spfft")       run_spfft    = true;
         else if (f == "--csc-binary-lut") csc_binary_lut = true;
         else if (f == "--csc-binary-stockham-smem") csc_binary_stockham_smem = true;
@@ -361,12 +305,14 @@ int main(int argc, char** argv) {
             if (repeat_iters <= 0)
                 throw std::runtime_error("--repeat must be positive");
         }
+        else {
+            throw std::runtime_error("Unknown option: " + f);
+        }
     }
 
     try {
         printf("Matrix: %s\n", argv[1]);
         COOMatrix coo   = read_mtx(argv[1]);
-        CSRMatrix csr   = coo_to_csr(coo);
         printf("Size:   %d x %d\n", coo.rows, coo.cols);
         printf("nnz:    %d  (density %.4f%%)\n\n",
                coo.nnz,
@@ -406,7 +352,7 @@ int main(int argc, char** argv) {
                 float min_ms = 0, max_ms = 0;
                 DenseFFTResult dr = run_repeated<DenseFFTResult>(repeat_iters,
                     [&] { return dense_fft(coo); }, &min_ms, &max_ms);
-                if (!dense_ref.available && (run_sparse || run_2pass || run_csr))
+                if (!dense_ref.available && (run_sparse || run_2pass))
                     dense_ref = make_dense_reference(dr, coo.rows, coo.cols);
                 print_bench("Dense cuFFT (baseline)", dr.ms, dr.mem_bytes,
                             repeat_iters, min_ms, max_ms);
@@ -578,211 +524,18 @@ int main(int argc, char** argv) {
         }
 
         // ===========================================================================
-        // DIAGNOSTIC — informational only; padded transform uses a different
-        // frequency grid so it cannot serve as a correctness reference.
-        // ===========================================================================
-        // --- Dense cuFFT (padded to next 7-smooth size) ---
-        if (dense_padded) {
-            NvtxRange _range("Dense cuFFT (padded)");
-            try {
-                float min_ms = 0, max_ms = 0;
-                DenseFFTResult dp = run_repeated<DenseFFTResult>(repeat_iters,
-                    [&] { return dense_fft_padded(coo); }, &min_ms, &max_ms);
-                char label[32];
-                snprintf(label, sizeof(label), "Dense cuFFT (%d²)", dp.padded_rows);
-                if (repeat_iters > 1) {
-                    printf("%-26s  %10.3f  %12.2f  [min %.3f, max %.3f]  n=%d  [NOTE: zero-padded]\n",
-                           label, dp.ms, dp.mem_bytes / 1e6, min_ms, max_ms, repeat_iters);
-                } else {
-                    printf("%-26s  %10.3f  %12.2f  [NOTE: zero-padded, different freq grid]\n",
-                           label, dp.ms, dp.mem_bytes / 1e6);
-                }
-                check_padded_vs_dense(dp, dense_ref);
-                cudaFree(dp.d_output);
-            } catch (const std::exception& e) {
-                printf("%-26s  %10s  %12s  [%s]\n",
-                       "Dense cuFFT (padded)", "OOM", "OOM", e.what());
-                cudaGetLastError();
-            }
-        }
-
-        // ===========================================================================
-        // EXPERIMENTAL / ABLATION VARIANTS — preserved for ablation studies but
-        // NOT part of the headline four-variant submission story.  Their
-        // implementations live in src/sparse_fft_*.cu and remain compiled in.
-        // Each block below is still callable via its individual --csc-* flag.
+        // SPARSE FFT VARIANTS.  Headline path (always runs when its flag is set):
+        //   --csc-stockham-smem            Stockham smem row FFT
+        //   --csc-stockham-cufft           Bluestein + cuFFT C2C (non-streaming)
+        //   --csc-stockham-cufft-stream    Bluestein + cuFFT C2C (streaming — only
+        //                                  variant that fits pct20stif on 24 GB)
         //
-        // Active flags in this section:
-        //   --csc-stockham-smem            (Stockham smem, radix-2 with smem fallback)
-        //   --csc-stockham-cufft           (Bluestein + cuFFT, non-streaming)
-        //   --csc-stockham-cufft-stream    (Bluestein + cuFFT, streaming — used for
-        //                                    pct20stif since headline #3 is non-streaming)
-        //   --csc-binary-lut               (binary byte-mask + LUT pass-1, cuFFT, streaming)
-        //   --csc-mixed-radix-graph        (#3 wrapped in a CUDA Graph)
-        //   --csc-binary-stockham-smem     (binary byte-mask + LUT pass-1, Stockham smem)
-        //
-        // Disabled blocks below (commented out): direct tiled DFT, COO 2-pass family,
-        // CSC 2-pass family (cached-W, tiled-p2, half-G), CSC streaming, the original
-        // Bluestein/Stockham non-cuFFT path, Stockham streaming, Stockham graph,
-        // CSR 2-pass.  Their kernel code is in src/sparse_fft_csc_2pass.cu /
-        // sparse_fft_coo_2pass.cu / sparse_fft_csr_2pass.cu / sparse_fft_direct_dft.cu.
+        // Experimental Bluestein variants live in src/sparse_fft_bluestein.cu and
+        // are gated behind their own --csc-* flags.  The earlier direct-DFT,
+        // COO 2-pass (custom/cuFFT/GEMM), CSC 2-pass (basic/cached-W/tiled/half-G),
+        // CSC streaming and CSR 2-pass paths have been removed; the relevant
+        // ablation history is in git (search for sparse_fft_experimental.cu).
         // ===========================================================================
-
-        // --- Sparse FFT: tiled direct DFT ---
-        // if (run_sparse) {
-        //     NvtxRange _range("Sparse (tiled DFT)");
-        //     try {
-        //         SparseFFTResult sr = sparse_fft(coo);
-        //         printf("%-26s  %10.3f  %12.2f\n",
-        //                "Sparse (tiled DFT)", sr.ms, sr.mem_bytes / 1e6);
-        //         cudaFree(sr.d_output);
-        //     } catch (const std::exception& e) {
-        //         printf("%-26s  %10s  %12s  [%s]\n",
-        //                "Sparse (tiled DFT)", "FAIL", "FAIL", e.what());
-        //     }
-        // }
-
-        // // --- Sparse FFT: two-pass COO ---
-        // if (run_2pass) {
-        //     NvtxRange _range("Sparse COO (2-pass)");
-        //     try {
-        //         SparseFFTResult sr2 = sparse_fft_2pass(coo);
-        //         printf("%-26s  %10.3f  %12.2f\n",
-        //                "Sparse COO (2-pass)", sr2.ms, sr2.mem_bytes / 1e6);
-        //         print_check("Sparse COO", dense_ref, sr2);
-        //         cudaFree(sr2.d_output);
-        //     } catch (const std::exception& e) {
-        //         printf("%-26s  %10s  %12s  [%s]\n",
-        //                "Sparse COO (2-pass)", "OOM", "OOM", e.what());
-        //     }
-        // }
-
-        // // --- Sparse FFT: COO pass 1 + cuFFT pass 2 ---
-        // if (run_2pass) {
-        //     NvtxRange _range("Sparse COO (cuFFT p2)");
-        //     try {
-        //         SparseFFTResult srcufft = sparse_fft_2pass_cufft(coo);
-        //         printf("%-26s  %10.3f  %12.2f\n",
-        //                "Sparse COO (cuFFT p2)", srcufft.ms, srcufft.mem_bytes / 1e6);
-        //         print_check("Sparse COO cuFFT", dense_ref, srcufft);
-        //         cudaFree(srcufft.d_output);
-        //     } catch (const std::exception& e) {
-        //         printf("%-26s  %10s  %12s  [%s]\n",
-        //                "Sparse COO (cuFFT p2)", "OOM", "OOM", e.what());
-        //         cudaGetLastError();
-        //     }
-        // }
-
-        // // --- Sparse FFT: COO pass 1 + cuBLAS GEMM pass 2 ---
-        // if (run_2pass) {
-        //     NvtxRange _range("Sparse COO (GEMM p2)");
-        //     try {
-        //         SparseFFTResult srgemm = sparse_fft_2pass_gemm(coo, false);
-        //         printf("%-26s  %10.3f  %12.2f\n",
-        //                "Sparse COO (GEMM p2)", srgemm.ms, srgemm.mem_bytes / 1e6);
-        //         print_check("Sparse COO GEMM", dense_ref, srgemm);
-        //         cudaFree(srgemm.d_output);
-        //     } catch (const std::exception& e) {
-        //         printf("%-26s  %10s  %12s  [%s]\n",
-        //                "Sparse COO (GEMM p2)", "OOM", "OOM", e.what());
-        //         cudaGetLastError();
-        //     }
-        // }
-
-        // // --- Sparse FFT: COO pass 1 + TF32 Tensor Core GEMM pass 2 ---
-        // if (run_2pass && gemm_tf32) {
-        //     NvtxRange _range("Sparse COO (GEMM TF32)");
-        //     try {
-        //         SparseFFTResult srtf32 = sparse_fft_2pass_gemm(coo, true);
-        //         printf("%-26s  %10.3f  %12.2f\n",
-        //                "Sparse COO (GEMM TF32)", srtf32.ms, srtf32.mem_bytes / 1e6);
-        //         print_check("Sparse COO TF32", dense_ref, srtf32);
-        //         cudaFree(srtf32.d_output);
-        //     } catch (const std::exception& e) {
-        //         printf("%-26s  %10s  %12s  [%s]\n",
-        //                "Sparse COO (GEMM TF32)", "OOM", "OOM", e.what());
-        //         cudaGetLastError();
-        //     }
-        // }
-
-        // // --- Sparse FFT: binary CSC two-pass ---
-        // if (run_2pass) {
-        //     NvtxRange _range("Sparse CSC (2-pass)");
-        //     try {
-        //         SparseFFTResult scsc = sparse_fft_csc_2pass(coo, csc_tile, false, false, false);
-        //         printf("%-26s  %10.3f  %12.2f\n",
-        //                "Sparse CSC (2-pass)", scsc.ms, scsc.mem_bytes / 1e6);
-        //         print_check("Sparse CSC", dense_ref, scsc);
-        //         cudaFree(scsc.d_output);
-        //     } catch (const std::exception& e) {
-        //         printf("%-26s  %10s  %12s  [%s]\n",
-        //                "Sparse CSC (2-pass)", "OOM", "OOM", e.what());
-        //         cudaGetLastError();
-        //     }
-        // }
-
-        // // --- Sparse FFT: binary CSC with cached column twiddles ---
-        // if (run_2pass && csc_cache_w) {
-        //     NvtxRange _range("Sparse CSC (cached W)");
-        //     try {
-        //         SparseFFTResult scscw = sparse_fft_csc_2pass(coo, csc_tile, true, false, false);
-        //         printf("%-26s  %10.3f  %12.2f\n",
-        //                "Sparse CSC (cached W)", scscw.ms, scscw.mem_bytes / 1e6);
-        //         print_check("Sparse CSC W", dense_ref, scscw);
-        //         cudaFree(scscw.d_output);
-        //     } catch (const std::exception& e) {
-        //         printf("%-26s  %10s  %12s  [%s]\n",
-        //                "Sparse CSC (cached W)", "OOM", "OOM", e.what());
-        //         cudaGetLastError();
-        //     }
-        // }
-
-        // // --- Sparse FFT: binary CSC with shared-memory tiled pass 2 ---
-        // if (run_2pass && csc_tiled_p2) {
-        //     NvtxRange _range("Sparse CSC (tiled p2)");
-        //     try {
-        //         SparseFFTResult scsct = sparse_fft_csc_2pass(coo, csc_tile, false, true, false);
-        //         printf("%-26s  %10.3f  %12.2f\n",
-        //                "Sparse CSC (tiled p2)", scsct.ms, scsct.mem_bytes / 1e6);
-        //         print_check("Sparse CSC tiled", dense_ref, scsct);
-        //         cudaFree(scsct.d_output);
-        //     } catch (const std::exception& e) {
-        //         printf("%-26s  %10s  %12s  [%s]\n",
-        //                "Sparse CSC (tiled p2)", "OOM", "OOM", e.what());
-        //         cudaGetLastError();
-        //     }
-        // }
-
-        // --- Sparse FFT: binary CSC with half-precision chunk storage ---
-        // if (run_2pass && csc_half_g) {
-        //     NvtxRange _range("Sparse CSC (half G)");
-        //     try {
-        //         SparseFFTResult scsch = sparse_fft_csc_2pass(coo, csc_tile, false, true, true);
-        //         printf("%-26s  %10.3f  %12.2f\n",
-        //                "Sparse CSC (half G)", scsch.ms, scsch.mem_bytes / 1e6);
-        //         print_check("Sparse CSC halfG", dense_ref, scsch);
-        //         cudaFree(scsch.d_output);
-        //     } catch (const std::exception& e) {
-        //         printf("%-26s  %10s  %12s  [%s]\n",
-        //                "Sparse CSC (half G)", "OOM", "OOM", e.what());
-        //     cudaGetLastError();  // clear sticky device error for next benchmark
-        //     }
-        // }
-
-        // // --- Sparse FFT: binary CSC streaming output chunks to host ---
-        // if (run_2pass && csc_stream) {
-        //     NvtxRange _range("Sparse CSC (stream)");
-        //     try {
-        //         SparseFFTResult scs = sparse_fft_csc_streaming(coo, csc_tile);
-        //         printf("%-26s  %10.3f  %12.2f\n",
-        //                "Sparse CSC (stream)", scs.ms, scs.mem_bytes / 1e6);
-        //         print_check("Sparse CSC stream", dense_ref, scs);
-        //     } catch (const std::exception& e) {
-        //         printf("%-26s  %10s  %12s  [%s]\n",
-        //                "Sparse CSC (stream)", "OOM", "OOM", e.what());
-        //         cudaGetLastError();
-        //     }
-        // }
 
         // // --- Sparse FFT: binary CSC with custom Bluestein FFT pass 2 ---
         // if (run_2pass && csc_bluestein) {
@@ -942,21 +695,6 @@ int main(int argc, char** argv) {
         //         printf("%-26s  %10s  %12s  [%s]\n",
         //                "Sparse CSC (Stockham graph)", "OOM", "OOM", e.what());
         //         cudaGetLastError();
-        //     }
-        // }
-
-        // // --- Sparse FFT: two-pass CSR ---
-        // if (run_csr) {
-        //     NvtxRange _range("Sparse CSR (2-pass)");
-        //     try {
-        //         SparseFFTResult src = sparse_fft_csr_2pass(csr);
-        //         printf("%-26s  %10.3f  %12.2f\n",
-        //                "Sparse CSR (2-pass)", src.ms, src.mem_bytes / 1e6);
-        //         print_check("Sparse CSR", dense_ref, src);
-        //         cudaFree(src.d_output);
-        //     } catch (const std::exception& e) {
-        //         printf("%-26s  %10s  %12s  [%s]\n",
-        //                "Sparse CSR (2-pass)", "OOM", "OOM", e.what());
         //     }
         // }
 
