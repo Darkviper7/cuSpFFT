@@ -17,10 +17,6 @@ set(SOURCES
     src/mtx_reader.cu
     src/dense_baseline.cu
     src/sparse_fft_bluestein.cu      # active benchmarks (Bluestein/Stockham/cuFFT)
-    src/sparse_fft_direct_dft.cu     # direct tiled COO DFT
-    src/sparse_fft_coo_2pass.cu      # COO 2-pass (custom DFT, cuFFT, GEMM)
-    src/sparse_fft_csc_2pass.cu      # CSC 2-pass (tiled col DFT + streaming)
-    src/sparse_fft_csr_2pass.cu      # CSR 2-pass
 )
 
 add_executable(cuSpFFT ${SOURCES})
@@ -50,4 +46,26 @@ if(ENABLE_SPFFT)
     find_package(SpFFT CONFIG REQUIRED)
     target_compile_definitions(cuSpFFT PRIVATE HAS_SPFFT)
     target_link_libraries(cuSpFFT PRIVATE SpFFT::spfft)
+endif()
+
+# Optional CPU reference baseline using FFTW3 single-precision.
+# Provides an independent CPU ground-truth FFT for correctness-checking every
+# CUDA variant (dense cuFFT, SpFFT, sparse paths).  Especially useful when the
+# GPU dense baseline cannot run (e.g. pct20stif).
+option(ENABLE_CPU_REFERENCE "Build CPU FFT reference using FFTW3 single-precision" OFF)
+if(ENABLE_CPU_REFERENCE)
+    find_path(FFTW3F_INCLUDE_DIR fftw3.h
+        HINTS $ENV{HOME}/local/include /usr/local/include /usr/include)
+    find_library(FFTW3F_LIBRARY fftw3f
+        HINTS $ENV{HOME}/local/lib /usr/local/lib /usr/lib /usr/lib/x86_64-linux-gnu)
+    if(NOT FFTW3F_INCLUDE_DIR OR NOT FFTW3F_LIBRARY)
+        message(FATAL_ERROR
+            "ENABLE_CPU_REFERENCE=ON but FFTW3 single-precision not found. "
+            "Install fftw-3.x with --enable-float and pass -DCMAKE_PREFIX_PATH "
+            "to point at its install prefix.")
+    endif()
+    target_sources(cuSpFFT PRIVATE src/cpu_reference.cpp)
+    target_include_directories(cuSpFFT PRIVATE ${FFTW3F_INCLUDE_DIR})
+    target_link_libraries(cuSpFFT PRIVATE ${FFTW3F_LIBRARY})
+    target_compile_definitions(cuSpFFT PRIVATE HAS_CPU_REF)
 endif()
