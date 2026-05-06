@@ -650,6 +650,28 @@ but they are memory-tight because they keep the full output on device. The
 Appendix describes a streaming variant that bounds device memory by tile
 size and runs pct20stif at about 474 MB.
 
+## Power-of-2 shape: delaunay_n14 (16,384 × 16,384, density 0.0366%)
+
+| Variant | Median (ms) | Memory (MB) | vs Dense cuFFT |
+|---|---:|---:|---|
+| Dense cuFFT | 7.81 | 3,228 | — |
+| SpFFT | 46.51 | 7,537 | 0.17× speed, 2.3× more memory |
+| CSC mixed-radix (custom) | 304.76 | 1,615 | 0.026× speed, 2.0× less memory |
+| CSC mixed-radix (cuFFT) | 68.56 | 1,617 | 0.114× speed, 2.0× less memory |
+
+On a clean power-of-2 column dimension with very low density, dense cuFFT
+is the right tool. `cols = 16384` is dense cuFFT's best path — a single
+batched 2-D plan, no prime-factor stalls, and a workspace that fits in
+about 3 GB. The sparse CSC variants still pay the Bluestein 2× length tax
+(`next_pow2(2·16384−1) = 32768`, and both `next_3_smooth` and
+`next_7_smooth` happen to land on the same value), so each column FFT is
+twice the work cuFFT performs on the dense grid; on top of that the
+sparse pipeline runs five passes (build, forward FFT, pointwise multiply,
+inverse FFT, finalize) versus one fused 2-D plan. The sparse methods
+still use about half the memory of dense cuFFT, which is the property
+that lets them remain runnable on shapes where dense plans fail
+(`pct20stif`) or workspaces exceed device memory.
+
 ## Sparse Binary Optimizations
 
 The sparse methods are specialized for matrices whose nonzero entries are
@@ -705,6 +727,16 @@ representation and the GPU computation.
   Bluestein lengths; on `benzene`, the custom path uses `fft_len = 17496`,
   while the cuFFT-backed path can use the smaller 7-smooth length `16464`.
   Adding radix-5 and radix-7 stages would reduce this gap.
+- **Power-of-2 column dimensions:** When `cols` is already a power of 2
+  (e.g. `delaunay_n14`, `cols = 16384`), the Bluestein convolution length
+  doubles to `2·cols`, so each column FFT does twice the work of dense
+  cuFFT on the same grid. Combined with the five-pass pipeline this puts
+  the sparse path well behind dense whenever the dense plan fits in
+  device memory. A specialization that detects power-of-2 cols and
+  bypasses Bluestein in favor of a direct batched length-`cols` cuFFT
+  would reduce the gap, but on shapes this small dense cuFFT is already
+  the right tool, so this is a completeness improvement rather than a
+  performance one.
 
 ---
 

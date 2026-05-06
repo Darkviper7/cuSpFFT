@@ -24,6 +24,19 @@ Makefile
 # Profiler output
 profiles/
 
+# Benchmark sweep output
+logs/
+logs_spfft/
+
+# Python virtualenv
+.venv/
+
+# Generated report figures (regenerable from logs/ via scripts/plot_results.py)
+figures/
+
+# Generated dataset subset lists (regenerable via scripts/list_spfft_safe.py)
+dataset_lists/
+
 # Dataset matrices (large binary files)
 dataset/**/*.mtx
 dataset/**/*.mtx.gz
@@ -39,3 +52,7 @@ dataset/**/*.mtx.gz
 .DS_Store
 Thumbs.db
 CLAUDE.md
+.claude/
+
+# Paper
+draftPaper/*
