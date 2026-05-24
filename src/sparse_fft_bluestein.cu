@@ -2263,6 +2263,11 @@ SparseFFTResult sparse_fft_csc_bluestein_mixed_radix(const COOMatrix& coo, int u
     const bool use_packed   = can_pack_u16(rows, cols);
     if (u_tile <= 0)
         throw std::runtime_error("CSC tile size must be positive");
+    // Adapt tile size to fft_len so each (tile_rows × fft_len) batch lands in
+    // the ~1.5M complex-element sweet spot. Two concurrent streams at this
+    // batch keep SM/HBM near saturation without contention. Caps at the
+    // user-supplied u_tile (so explicit --csc-tile is respected); floors at 8.
+    const int eff_tile = std::min(u_tile, std::max(8, 1500000 / fft_len));
 
     DeviceMemPeak peak_tracker;
     CompactCSC csc = make_compact_csc(coo);
@@ -2299,7 +2304,7 @@ SparseFFTResult sparse_fft_csc_bluestein_mixed_radix(const COOMatrix& coo, int u
     CUDA_CHECK(cudaMemcpy(d_chirp, h_chirp.data(),
                           (size_t)cols * sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
 
-    const int max_tile_rows = std::min(u_tile, rows);
+    const int max_tile_rows = std::min(eff_tile, rows);
     // Double-buffered tile pipeline: two d_signal/d_work slabs and two streams so
     // tile N's build/FFT/multiply/IFFT runs on stream[buf] while tile (N-1)'s
     // finalize/output write completes on the opposite stream. d_out stays single-
@@ -2337,9 +2342,9 @@ SparseFFTResult sparse_fft_csc_bluestein_mixed_radix(const COOMatrix& coo, int u
     CUDA_CHECK(cudaEventCreate(&t1));
     CUDA_CHECK(cudaEventRecord(t0));
 
-    for (int u_base = 0; u_base < rows; u_base += u_tile) {
-        const int tile_rows = std::min(u_tile, rows - u_base);
-        const int buf = (u_base / u_tile) & 1;
+    for (int u_base = 0; u_base < rows; u_base += eff_tile) {
+        const int tile_rows = std::min(eff_tile, rows - u_base);
+        const int buf = (u_base / eff_tile) & 1;
         cudaStream_t stream = streams[buf];
         cuFloatComplex* sig = d_signal[buf];
         cuFloatComplex* wrk = d_work[buf];
@@ -2585,6 +2590,11 @@ SparseFFTResult sparse_fft_csc_bluestein_cufft_smooth(const COOMatrix& coo, int 
     const bool use_packed   = can_pack_u16(rows, cols);
     if (u_tile <= 0)
         throw std::runtime_error("CSC tile size must be positive");
+    // Adapt tile size to fft_len so each (tile_rows × fft_len) batch lands in
+    // the ~1.5M complex-element sweet spot. Two concurrent streams at this
+    // batch keep SM/HBM near saturation without contention. Caps at the
+    // user-supplied u_tile (so explicit --csc-tile is respected); floors at 8.
+    const int eff_tile = std::min(u_tile, std::max(8, 1500000 / fft_len));
 
     DeviceMemPeak peak_tracker;
     CompactCSC csc = make_compact_csc(coo);
@@ -2636,7 +2646,7 @@ SparseFFTResult sparse_fft_csc_bluestein_cufft_smooth(const COOMatrix& coo, int 
         CUFFT_CHECK(cufftDestroy(plan_b));
     }
 
-    const int max_tile_rows = std::min(u_tile, rows);
+    const int max_tile_rows = std::min(eff_tile, rows);
     // Double-buffered tile pipeline: two in-place d_signal slabs (cuFFT C2C runs
     // in-place) and two streams so tile N's forward-FFT/multiply/inverse-FFT can
     // overlap with tile (N-1)'s finalize/d_out write. Each full-tile cuFFT plan
@@ -2670,7 +2680,7 @@ SparseFFTResult sparse_fft_csc_bluestein_cufft_smooth(const COOMatrix& coo, int 
             CUFFT_CHECK(cufftGetSize(plan_cufft[i], &ws));
             cufft_workspace = std::max(cufft_workspace, ws);
         }
-        const int last_tile = rows % u_tile;
+        const int last_tile = rows % eff_tile;
         if (last_tile != 0 && last_tile != full_tile) {
             CUFFT_CHECK(cufftPlanMany(&plan_cufft_last, 1, &fl, nullptr, 1, fft_len,
                                       nullptr, 1, fft_len, CUFFT_C2C, last_tile));
@@ -2685,9 +2695,9 @@ SparseFFTResult sparse_fft_csc_bluestein_cufft_smooth(const COOMatrix& coo, int 
     CUDA_CHECK(cudaEventCreate(&t1));
     CUDA_CHECK(cudaEventRecord(t0));
 
-    for (int u_base = 0; u_base < rows; u_base += u_tile) {
-        const int tile_rows = std::min(u_tile, rows - u_base);
-        const int buf = (u_base / u_tile) & 1;
+    for (int u_base = 0; u_base < rows; u_base += eff_tile) {
+        const int tile_rows = std::min(eff_tile, rows - u_base);
+        const int buf = (u_base / eff_tile) & 1;
         cudaStream_t stream = streams[buf];
         cuFloatComplex* sig = d_signal[buf];
         const size_t signal_bytes = (size_t)tile_rows * fft_len * sizeof(cuFloatComplex);
