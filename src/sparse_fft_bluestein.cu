@@ -2300,24 +2300,37 @@ SparseFFTResult sparse_fft_csc_bluestein_mixed_radix(const COOMatrix& coo, int u
                           (size_t)cols * sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
 
     const int max_tile_rows = std::min(u_tile, rows);
-    cuFloatComplex *d_signal = nullptr, *d_work = nullptr, *d_out = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_signal,
-        (size_t)max_tile_rows * fft_len * sizeof(cuFloatComplex)));
-    CUDA_CHECK(cudaMalloc(&d_work,
-        (size_t)max_tile_rows * fft_len * sizeof(cuFloatComplex)));
+    // Double-buffered tile pipeline: two d_signal/d_work slabs and two streams so
+    // tile N's build/FFT/multiply/IFFT runs on stream[buf] while tile (N-1)'s
+    // finalize/output write completes on the opposite stream. d_out stays single-
+    // buffered — tiles write disjoint row stripes [u_base, u_base+tile_rows).
+    cuFloatComplex *d_signal[2] = {nullptr, nullptr};
+    cuFloatComplex *d_work[2]   = {nullptr, nullptr};
+    cuFloatComplex *d_out       = nullptr;
+    for (int i = 0; i < 2; ++i) {
+        CUDA_CHECK(cudaMalloc(&d_signal[i],
+            (size_t)max_tile_rows * fft_len * sizeof(cuFloatComplex)));
+        CUDA_CHECK(cudaMalloc(&d_work[i],
+            (size_t)max_tile_rows * fft_len * sizeof(cuFloatComplex)));
+    }
     CUDA_CHECK(cudaMalloc(&d_out,
         (size_t)rows * output_stride * sizeof(cuFloatComplex)));
 
-    // Precompute d_b_fft via mixed-radix FFT (no cuFFT).
-    CUDA_CHECK(cudaMemcpy(d_signal, h_b.data(),
+    // Precompute d_b_fft via mixed-radix FFT (no cuFFT). One-shot setup on the
+    // default stream using slab 0; loop allocations sync below before reuse.
+    CUDA_CHECK(cudaMemcpy(d_signal[0], h_b.data(),
                           (size_t)fft_len * sizeof(cuFloatComplex), cudaMemcpyHostToDevice));
     {
-        cuFloatComplex* res = run_fft_mixed_23(d_signal, d_work, fft_len, factors, 1, false, 0);
+        cuFloatComplex* res = run_fft_mixed_23(d_signal[0], d_work[0], fft_len, factors, 1, false, 0);
         if (res != d_b_fft)
             CUDA_CHECK(cudaMemcpy(d_b_fft, res, (size_t)fft_len * sizeof(cuFloatComplex),
                                   cudaMemcpyDeviceToDevice));
     }
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    cudaStream_t streams[2];
+    CUDA_CHECK(cudaStreamCreate(&streams[0]));
+    CUDA_CHECK(cudaStreamCreate(&streams[1]));
 
     cudaEvent_t t0, t1;
     CUDA_CHECK(cudaEventCreate(&t0));
@@ -2326,50 +2339,55 @@ SparseFFTResult sparse_fft_csc_bluestein_mixed_radix(const COOMatrix& coo, int u
 
     for (int u_base = 0; u_base < rows; u_base += u_tile) {
         const int tile_rows = std::min(u_tile, rows - u_base);
+        const int buf = (u_base / u_tile) & 1;
+        cudaStream_t stream = streams[buf];
+        cuFloatComplex* sig = d_signal[buf];
+        cuFloatComplex* wrk = d_work[buf];
         const size_t signal_bytes = (size_t)tile_rows * fft_len * sizeof(cuFloatComplex);
-        CUDA_CHECK(cudaMemset(d_signal, 0, signal_bytes));
+        CUDA_CHECK(cudaMemsetAsync(sig, 0, signal_bytes, stream));
 
         // Pass 1: standard binary CSC build (sincosf-per-nonzero, packed indices).
         dim3 p1_block(CSC_BU);
         dim3 p1_grid(n_sp, (tile_rows + CSC_BU - 1) / CSC_BU);
         if (use_packed) {
-            csc_build_bluestein_input_packed_kernel<<<p1_grid, p1_block>>>(
-                d_col_ptr, d_row_idx_packed, d_sp_cols_packed, d_chirp, d_signal,
+            csc_build_bluestein_input_packed_kernel<<<p1_grid, p1_block, 0, stream>>>(
+                d_col_ptr, d_row_idx_packed, d_sp_cols_packed, d_chirp, sig,
                 rows, n_sp, fft_len, u_base, tile_rows, 1.f / (float)rows);
         } else {
-            csc_build_bluestein_input_kernel<<<p1_grid, p1_block>>>(
-                d_col_ptr, d_row_idx, d_sp_cols, d_chirp, d_signal,
+            csc_build_bluestein_input_kernel<<<p1_grid, p1_block, 0, stream>>>(
+                d_col_ptr, d_row_idx, d_sp_cols, d_chirp, sig,
                 rows, n_sp, fft_len, u_base, tile_rows, 1.f / (float)rows);
         }
         CUDA_CHECK(cudaGetLastError());
 
         // Forward FFT (mixed-radix).
         cuFloatComplex* fwd = run_fft_mixed_23(
-            d_signal, d_work, fft_len, factors, tile_rows, false, 0);
-        cuFloatComplex* fwd_other = (fwd == d_signal) ? d_work : d_signal;
+            sig, wrk, fft_len, factors, tile_rows, false, stream);
+        cuFloatComplex* fwd_other = (fwd == sig) ? wrk : sig;
 
         // Pointwise multiply by d_b_fft.
         const int total_elems = tile_rows * fft_len;
-        pointwise_mul_batched_kernel<<<(total_elems + 255) / 256, 256>>>(
+        pointwise_mul_batched_kernel<<<(total_elems + 255) / 256, 256, 0, stream>>>(
             fwd, d_b_fft, fft_len, tile_rows);
         CUDA_CHECK(cudaGetLastError());
 
         // Inverse FFT (mixed-radix). Result lands in fwd_other or fwd depending on parity;
         // run_fft_mixed_23 returns the right pointer.
         cuFloatComplex* conv_result = run_fft_mixed_23(
-            fwd, fwd_other, fft_len, factors, tile_rows, true, 0);
+            fwd, fwd_other, fft_len, factors, tile_rows, true, stream);
 
         // Finalize: multiply by chirp_conj, write into d_out.
         dim3 f_block(32, 8);
         dim3 f_grid((output_cols + f_block.x - 1) / f_block.x,
                     (tile_rows + f_block.y - 1) / f_block.y);
-        bluestein_finalize_kernel<<<f_grid, f_block>>>(
+        bluestein_finalize_kernel<<<f_grid, f_block, 0, stream>>>(
             conv_result, d_chirp, d_out,
             rows, output_stride, output_cols, fft_len, u_base, tile_rows);
         CUDA_CHECK(cudaGetLastError());
     }
 
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaStreamSynchronize(streams[0]));
+    CUDA_CHECK(cudaStreamSynchronize(streams[1]));
     CUDA_CHECK(cudaEventRecord(t1));
     CUDA_CHECK(cudaEventSynchronize(t1));
     float ms = 0.f;
@@ -2378,6 +2396,8 @@ SparseFFTResult sparse_fft_csc_bluestein_mixed_radix(const COOMatrix& coo, int u
 
     cudaEventDestroy(t0);
     cudaEventDestroy(t1);
+    cudaStreamDestroy(streams[0]);
+    cudaStreamDestroy(streams[1]);
     cudaFree(d_col_ptr);
     cudaFree(d_row_idx);
     cudaFree(d_sp_cols);
@@ -2385,8 +2405,10 @@ SparseFFTResult sparse_fft_csc_bluestein_mixed_radix(const COOMatrix& coo, int u
     cudaFree(d_sp_cols_packed);
     cudaFree(d_chirp);
     cudaFree(d_b_fft);
-    cudaFree(d_signal);
-    cudaFree(d_work);
+    cudaFree(d_signal[0]);
+    cudaFree(d_signal[1]);
+    cudaFree(d_work[0]);
+    cudaFree(d_work[1]);
 
     return {d_out, output_stride, ms, mem_bytes, {}};
 }
@@ -2615,27 +2637,44 @@ SparseFFTResult sparse_fft_csc_bluestein_cufft_smooth(const COOMatrix& coo, int 
     }
 
     const int max_tile_rows = std::min(u_tile, rows);
-    cuFloatComplex *d_signal = nullptr, *d_out = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_signal,
-        (size_t)max_tile_rows * fft_len * sizeof(cuFloatComplex)));
+    // Double-buffered tile pipeline: two in-place d_signal slabs (cuFFT C2C runs
+    // in-place) and two streams so tile N's forward-FFT/multiply/inverse-FFT can
+    // overlap with tile (N-1)'s finalize/d_out write. Each full-tile cuFFT plan
+    // is bound to its own stream via cufftSetStream.
+    cuFloatComplex *d_signal[2] = {nullptr, nullptr};
+    cuFloatComplex *d_out       = nullptr;
+    for (int i = 0; i < 2; ++i) {
+        CUDA_CHECK(cudaMalloc(&d_signal[i],
+            (size_t)max_tile_rows * fft_len * sizeof(cuFloatComplex)));
+    }
     CUDA_CHECK(cudaMalloc(&d_out,
         (size_t)rows * output_stride * sizeof(cuFloatComplex)));
 
-    // Tile-loop cuFFT plans (full tile + last partial tile if size differs).
-    cufftHandle plan_cufft = 0, plan_cufft_last = 0;
+    cudaStream_t streams[2];
+    CUDA_CHECK(cudaStreamCreate(&streams[0]));
+    CUDA_CHECK(cudaStreamCreate(&streams[1]));
+
+    // Tile-loop cuFFT plans: one full-tile plan per stream, one shared last-tile
+    // plan whose stream is rebound dynamically (last tile runs only once).
+    cufftHandle plan_cufft[2] = {0, 0};
+    cufftHandle plan_cufft_last = 0;
     size_t cufft_workspace = 0;
     {
         int fl = fft_len;
         const int full_tile = max_tile_rows;
-        CUFFT_CHECK(cufftPlanMany(&plan_cufft, 1, &fl, nullptr, 1, fft_len,
-                                  nullptr, 1, fft_len, CUFFT_C2C, full_tile));
-        size_t ws = 0;
-        CUFFT_CHECK(cufftGetSize(plan_cufft, &ws));
-        cufft_workspace = ws;
+        for (int i = 0; i < 2; ++i) {
+            CUFFT_CHECK(cufftPlanMany(&plan_cufft[i], 1, &fl, nullptr, 1, fft_len,
+                                      nullptr, 1, fft_len, CUFFT_C2C, full_tile));
+            CUFFT_CHECK(cufftSetStream(plan_cufft[i], streams[i]));
+            size_t ws = 0;
+            CUFFT_CHECK(cufftGetSize(plan_cufft[i], &ws));
+            cufft_workspace = std::max(cufft_workspace, ws);
+        }
         const int last_tile = rows % u_tile;
         if (last_tile != 0 && last_tile != full_tile) {
             CUFFT_CHECK(cufftPlanMany(&plan_cufft_last, 1, &fl, nullptr, 1, fft_len,
                                       nullptr, 1, fft_len, CUFFT_C2C, last_tile));
+            size_t ws = 0;
             CUFFT_CHECK(cufftGetSize(plan_cufft_last, &ws));
             cufft_workspace = std::max(cufft_workspace, ws);
         }
@@ -2648,54 +2687,62 @@ SparseFFTResult sparse_fft_csc_bluestein_cufft_smooth(const COOMatrix& coo, int 
 
     for (int u_base = 0; u_base < rows; u_base += u_tile) {
         const int tile_rows = std::min(u_tile, rows - u_base);
+        const int buf = (u_base / u_tile) & 1;
+        cudaStream_t stream = streams[buf];
+        cuFloatComplex* sig = d_signal[buf];
         const size_t signal_bytes = (size_t)tile_rows * fft_len * sizeof(cuFloatComplex);
-        CUDA_CHECK(cudaMemset(d_signal, 0, signal_bytes));
+        CUDA_CHECK(cudaMemsetAsync(sig, 0, signal_bytes, stream));
 
         // Pass 1: standard binary CSC build (sincosf-per-nonzero, packed indices).
         dim3 p1_block(CSC_BU);
         dim3 p1_grid(n_sp, (tile_rows + CSC_BU - 1) / CSC_BU);
         if (use_packed) {
-            csc_build_bluestein_input_packed_kernel<<<p1_grid, p1_block>>>(
-                d_col_ptr, d_row_idx_packed, d_sp_cols_packed, d_chirp, d_signal,
+            csc_build_bluestein_input_packed_kernel<<<p1_grid, p1_block, 0, stream>>>(
+                d_col_ptr, d_row_idx_packed, d_sp_cols_packed, d_chirp, sig,
                 rows, n_sp, fft_len, u_base, tile_rows, 1.f / (float)rows);
         } else {
-            csc_build_bluestein_input_kernel<<<p1_grid, p1_block>>>(
-                d_col_ptr, d_row_idx, d_sp_cols, d_chirp, d_signal,
+            csc_build_bluestein_input_kernel<<<p1_grid, p1_block, 0, stream>>>(
+                d_col_ptr, d_row_idx, d_sp_cols, d_chirp, sig,
                 rows, n_sp, fft_len, u_base, tile_rows, 1.f / (float)rows);
         }
         CUDA_CHECK(cudaGetLastError());
 
         // Bluestein convolution via cuFFT (forward + multiply + inverse + scale).
-        cufftHandle tile_plan =
-            (plan_cufft_last && tile_rows != max_tile_rows)
-            ? plan_cufft_last : plan_cufft;
+        cufftHandle tile_plan;
+        if (plan_cufft_last && tile_rows != max_tile_rows) {
+            CUFFT_CHECK(cufftSetStream(plan_cufft_last, stream));
+            tile_plan = plan_cufft_last;
+        } else {
+            tile_plan = plan_cufft[buf];
+        }
         CUFFT_CHECK(cufftExecC2C(tile_plan,
-            reinterpret_cast<cufftComplex*>(d_signal),
-            reinterpret_cast<cufftComplex*>(d_signal),
+            reinterpret_cast<cufftComplex*>(sig),
+            reinterpret_cast<cufftComplex*>(sig),
             CUFFT_FORWARD));
         const int total_elems = tile_rows * fft_len;
-        pointwise_mul_batched_kernel<<<(total_elems + 255) / 256, 256>>>(
-            d_signal, d_b_fft, fft_len, tile_rows);
+        pointwise_mul_batched_kernel<<<(total_elems + 255) / 256, 256, 0, stream>>>(
+            sig, d_b_fft, fft_len, tile_rows);
         CUDA_CHECK(cudaGetLastError());
         CUFFT_CHECK(cufftExecC2C(tile_plan,
-            reinterpret_cast<cufftComplex*>(d_signal),
-            reinterpret_cast<cufftComplex*>(d_signal),
+            reinterpret_cast<cufftComplex*>(sig),
+            reinterpret_cast<cufftComplex*>(sig),
             CUFFT_INVERSE));
-        scale_complex_kernel<<<(total_elems + 255) / 256, 256>>>(
-            d_signal, total_elems, 1.f / (float)fft_len);
+        scale_complex_kernel<<<(total_elems + 255) / 256, 256, 0, stream>>>(
+            sig, total_elems, 1.f / (float)fft_len);
         CUDA_CHECK(cudaGetLastError());
 
         // Finalize: chirp_conj × conv → d_out at u_base offset.
         dim3 f_block(32, 8);
         dim3 f_grid((output_cols + f_block.x - 1) / f_block.x,
                     (tile_rows + f_block.y - 1) / f_block.y);
-        bluestein_finalize_kernel<<<f_grid, f_block>>>(
-            d_signal, d_chirp, d_out,
+        bluestein_finalize_kernel<<<f_grid, f_block, 0, stream>>>(
+            sig, d_chirp, d_out,
             rows, output_stride, output_cols, fft_len, u_base, tile_rows);
         CUDA_CHECK(cudaGetLastError());
     }
 
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaStreamSynchronize(streams[0]));
+    CUDA_CHECK(cudaStreamSynchronize(streams[1]));
     CUDA_CHECK(cudaEventRecord(t1));
     CUDA_CHECK(cudaEventSynchronize(t1));
     float ms = 0.f;
@@ -2704,7 +2751,10 @@ SparseFFTResult sparse_fft_csc_bluestein_cufft_smooth(const COOMatrix& coo, int 
 
     cudaEventDestroy(t0);
     cudaEventDestroy(t1);
-    if (plan_cufft)      cufftDestroy(plan_cufft);
+    cudaStreamDestroy(streams[0]);
+    cudaStreamDestroy(streams[1]);
+    if (plan_cufft[0]) cufftDestroy(plan_cufft[0]);
+    if (plan_cufft[1]) cufftDestroy(plan_cufft[1]);
     if (plan_cufft_last) cufftDestroy(plan_cufft_last);
     cudaFree(d_col_ptr);
     cudaFree(d_row_idx);
@@ -2713,7 +2763,8 @@ SparseFFTResult sparse_fft_csc_bluestein_cufft_smooth(const COOMatrix& coo, int 
     cudaFree(d_sp_cols_packed);
     cudaFree(d_chirp);
     cudaFree(d_b_fft);
-    cudaFree(d_signal);
+    cudaFree(d_signal[0]);
+    cudaFree(d_signal[1]);
 
     return {d_out, output_stride, ms, mem_bytes, {}};
 }
