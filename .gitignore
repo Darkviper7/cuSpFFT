@@ -53,6 +53,8 @@ dataset/**/*.mtx.gz
 Thumbs.db
 CLAUDE.md
 .claude/
+.codex/
+.agents/
 
 # Paper
 draftPaper/*
