@@ -26,6 +26,7 @@ profiles/
 
 # Benchmark sweep output
 logs/
+logs*/
 logs_spfft/
 
 # Python virtualenv
@@ -40,6 +41,7 @@ dataset_lists/
 # Dataset matrices (large binary files)
 dataset/**/*.mtx
 dataset/**/*.mtx.gz
+dataset_sampled/*
 
 # Editor / IDE
 .vscode/

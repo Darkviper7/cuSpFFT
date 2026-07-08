@@ -3,6 +3,7 @@
 #include <cufft.h>
 #include <stdexcept>
 #include <cstring>
+#include <chrono>
 
 #define CUDA_CHECK(call)                                                     \
     do {                                                                     \
@@ -31,6 +32,9 @@ __global__ void coo_to_dense(const int* row_idx, const int* col_idx,
 }
 
 DenseFFTResult dense_fft(const COOMatrix& coo) {
+    // Preprocessing wall clock: H2D + dense-grid scatter + plan creation, i.e.
+    // everything up to (but not including) the timed cufftExecR2C region.
+    const auto _pre0 = std::chrono::steady_clock::now();
     const int rows = coo.rows;
     const int cols = coo.cols;
     const size_t dense_floats = (size_t)rows * cols;
@@ -88,6 +92,13 @@ DenseFFTResult dense_fft(const COOMatrix& coo) {
 
         CUDA_CHECK(cudaEventCreate(&t0));
         CUDA_CHECK(cudaEventCreate(&t1));
+
+        // Finish all setup GPU work (scatter, plan workspace) so it is charged to
+        // preprocessing, not to the kernel timer.
+        CUDA_CHECK(cudaDeviceSynchronize());
+        const float preprocess_ms = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - _pre0).count();
+
         CUDA_CHECK(cudaEventRecord(t0));
 
         CUFFT_CHECK(cufftExecR2C(plan, d_dense, d_out));
@@ -110,9 +121,10 @@ DenseFFTResult dense_fft(const COOMatrix& coo) {
         cudaFree(d_dense);
 
         DenseFFTResult result;
-        result.d_output  = d_out;
-        result.ms        = ms;
-        result.mem_bytes = peak;
+        result.d_output      = d_out;
+        result.ms            = ms;
+        result.preprocess_ms = preprocess_ms;
+        result.mem_bytes     = peak;
         return result;
 
     } catch (...) {

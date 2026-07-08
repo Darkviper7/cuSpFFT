@@ -4,13 +4,15 @@
 #   awk -v MATRIX="$name" -v TS="$STAMP" -f scripts/parse_log.awk <log>
 #
 # Output schema (one row per (matrix, method) seen in the log):
-#   timestamp,matrix,rows,cols,nnz,method,median_ms,min_ms,max_ms,n_iters,mem_mb,max_abs,max_rel,rms_abs,error
+#   timestamp,matrix,rows,cols,nnz,method,median_ms,min_ms,max_ms,n_iters,mem_mb,preprocess_ms,max_abs,max_rel,rms_abs,error
 #
 # Four regex blocks match the four stable printf formats in src/main.cu:
-#   1. Repeat-mode summary (main.cu:77-78):
-#      "%-26s  %10.3f  %12.2f  [min %.3f, max %.3f]  n=%d\n"
-#   2. Single-run summary (main.cu:80-81 and the CPU baseline at main.cu:334):
-#      "%-26s  %10.3f  %12.2f\n"   (trailing trivia after %.2f is tolerated)
+#   1. Repeat-mode summary (main.cu):
+#      "%-26s  %10.3f  %12.2f  [min %.3f, max %.3f]  n=%d  prep %.3f\n"
+#   2. Single-run summary (main.cu and the CPU baseline):
+#      "%-26s  %10.3f  %12.2f  prep %.3f\n"   (trailing trivia after %.2f is tolerated)
+#   preprocess_ms (host setup: build+H2D+plan) is captured from the " prep X"
+#   token when present (0 for methods not yet instrumented; empty for CPU ref).
 #   3. Correctness check (main.cu:164,213):
 #      "  check %-19s  max_abs %.3e  max_rel %.3e  rms_abs %.3e\n"
 #   4. Failure / OOM (catch blocks, e.g. main.cu:365-366):
@@ -96,10 +98,11 @@ match($0, /^(.{26})  +OOM +OOM +\[(.*)\]$/, m) {
 # --- Repeat-mode summary ------------------------------------------------------
 # "Variant Label             123.456     789.01  [min 120.000, max 130.000]  n=10"
 
-match($0, /^(.{26})  +([0-9.]+) +([0-9.]+) +\[min ([0-9.]+), max ([0-9.]+)\] +n=([0-9]+)/, m) {
+match($0, /^(.{26})  +([0-9.]+) +([0-9.]+) +\[min ([0-9.]+), max ([0-9.]+)\] +n=([0-9]+)( +prep ([0-9.]+))?/, m) {
     method = trim_right(m[1])
     key = canon(method)
     timing[key] = m[2] OFS m[4] OFS m[5] OFS m[6] OFS m[3]
+    preproc[key] = m[8]
     record(method)
     next
 }
@@ -108,11 +111,12 @@ match($0, /^(.{26})  +([0-9.]+) +([0-9.]+) +\[min ([0-9.]+), max ([0-9.]+)\] +n=
 # "Variant Label             123.456     789.01"   (and tolerate trailing
 # annotations like "  [CPU, FFTW3 single-thread]")
 
-match($0, /^(.{26})  +([0-9.]+) +([0-9.]+)([[:space:]].*)?$/, m) {
+match($0, /^(.{26})  +([0-9.]+) +([0-9.]+)(  +prep ([0-9.]+))?([[:space:]].*)?$/, m) {
     method = trim_right(m[1])
     key = canon(method)
     if (!(key in timing)) {
         timing[key] = m[2] OFS "" OFS "" OFS "1" OFS m[3]
+        preproc[key] = m[5]
         record(method)
     }
     next
@@ -135,6 +139,7 @@ END {
         key = canon(method)
         c = (key in correct) ? correct[key] : ",,"
         e = (key in errors) ? csv_escape(errors[key]) : ""
-        print TS, MATRIX, rows, cols, nnz, method, timing[key], c, e
+        p = (key in preproc) ? preproc[key] : ""
+        print TS, MATRIX, rows, cols, nnz, method, timing[key], p, c, e
     }
 }

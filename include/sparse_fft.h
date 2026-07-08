@@ -10,6 +10,8 @@ struct SparseFFTResult {
     float           ms;       // total compute time in milliseconds
     size_t          mem_bytes; // peak device memory allocated (bytes)
     std::vector<cuFloatComplex> h_output; // optional host output for streamed methods
+    // Added at end so existing positional brace-init returns stay valid.
+    float           preprocess_ms = 0.f; // host setup: CSC build + H2D + precompute + plan (pre-kernel)
 };
 
 // FFT-style CSC variant:

@@ -47,7 +47,9 @@ static Result run_repeated(int n_iters, Fn&& fn,
                             float* out_min = nullptr, float* out_max = nullptr) {
     Result result{};
     std::vector<float> times;
+    std::vector<float> preps;   // per-run host preprocessing wall-clock
     times.reserve(n_iters);
+    preps.reserve(n_iters);
 
     if (n_iters > 1) {
         result = fn();
@@ -58,11 +60,17 @@ static Result run_repeated(int n_iters, Fn&& fn,
         if (i > 0 && result.d_output) { cudaFree(result.d_output); }
         result = fn();
         times.push_back(result.ms);
+        preps.push_back(result.preprocess_ms);
     }
 
     if (n_iters > 1) {
         std::sort(times.begin(), times.end());
         result.ms = times[n_iters / 2];
+        // Median the preprocessing too, so a one-off host CPU spike during a
+        // single run doesn't skew the reported preprocess_ms (kernel .ms is
+        // already a median over the timed runs).
+        std::sort(preps.begin(), preps.end());
+        result.preprocess_ms = preps[n_iters / 2];
         if (out_min) *out_min = times.front();
         if (out_max) *out_max = times.back();
     }
@@ -72,13 +80,15 @@ static Result run_repeated(int n_iters, Fn&& fn,
 // Single-run mode: legacy 2-column output.
 // Multi-run mode:  median in column 2, [min/max] + n in trailing brackets.
 static void print_bench(const char* label, float median_ms, size_t mem_bytes,
-                         int n_iters, float min_ms, float max_ms) {
+                         int n_iters, float min_ms, float max_ms,
+                         float preprocess_ms = 0.f) {
     if (n_iters > 1) {
-        printf("%-26s  %10.3f  %12.2f  [min %.3f, max %.3f]  n=%d\n",
-               label, median_ms, mem_bytes / 1e6, min_ms, max_ms, n_iters);
+        printf("%-26s  %10.3f  %12.2f  [min %.3f, max %.3f]  n=%d  prep %.3f\n",
+               label, median_ms, mem_bytes / 1e6, min_ms, max_ms, n_iters,
+               preprocess_ms);
     } else {
-        printf("%-26s  %10.3f  %12.2f\n",
-               label, median_ms, mem_bytes / 1e6);
+        printf("%-26s  %10.3f  %12.2f  prep %.3f\n",
+               label, median_ms, mem_bytes / 1e6, preprocess_ms);
     }
 }
 
@@ -355,7 +365,7 @@ int main(int argc, char** argv) {
                 if (!dense_ref.available && (run_sparse || run_2pass))
                     dense_ref = make_dense_reference(dr, coo.rows, coo.cols);
                 print_bench("Dense cuFFT (baseline)", dr.ms, dr.mem_bytes,
-                            repeat_iters, min_ms, max_ms);
+                            repeat_iters, min_ms, max_ms, dr.preprocess_ms);
                 // If the reference came from elsewhere (CPU), check dense cuFFT
                 // against it — gives an explicit cuFFT-vs-CPU correctness number.
                 if (ref_was_external)
@@ -491,7 +501,7 @@ int main(int argc, char** argv) {
                     [&] { return sparse_fft_csc_bluestein_mixed_radix(coo, csc_tile); },
                     &min_ms, &max_ms);
                 print_bench("Sparse CSC (mixed-radix)", sc.ms, sc.mem_bytes,
-                            repeat_iters, min_ms, max_ms);
+                            repeat_iters, min_ms, max_ms, sc.preprocess_ms);
                 print_check("Sparse CSC mixed-radix", dense_ref, sc);
                 cudaFree(sc.d_output);
             } catch (const std::exception& e) {
@@ -513,7 +523,7 @@ int main(int argc, char** argv) {
                     [&] { return sparse_fft_csc_bluestein_cufft_smooth(coo, csc_tile); },
                     &min_ms, &max_ms);
                 print_bench("Sparse CSC (cufft smooth)", sc.ms, sc.mem_bytes,
-                            repeat_iters, min_ms, max_ms);
+                            repeat_iters, min_ms, max_ms, sc.preprocess_ms);
                 print_check("Sparse CSC cufft smooth", dense_ref, sc);
                 cudaFree(sc.d_output);
             } catch (const std::exception& e) {

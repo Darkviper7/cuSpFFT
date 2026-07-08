@@ -2254,6 +2254,7 @@ static cuFloatComplex* run_fft_mixed_23(
 }
 
 SparseFFTResult sparse_fft_csc_bluestein_mixed_radix(const COOMatrix& coo, int u_tile) {
+    const auto _pre0 = std::chrono::steady_clock::now();
     const int rows = coo.rows;
     const int cols = coo.cols;
     const int output_cols   = cols / 2 + 1;
@@ -2340,6 +2341,13 @@ SparseFFTResult sparse_fft_csc_bluestein_mixed_radix(const COOMatrix& coo, int u
     cudaEvent_t t0, t1;
     CUDA_CHECK(cudaEventCreate(&t0));
     CUDA_CHECK(cudaEventCreate(&t1));
+
+    // Finish all setup GPU work (d_b_fft precompute, H2D) so it is charged to
+    // preprocessing, not to the kernel timer.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const float preprocess_ms = std::chrono::duration<float, std::milli>(
+        std::chrono::steady_clock::now() - _pre0).count();
+
     CUDA_CHECK(cudaEventRecord(t0));
 
     for (int u_base = 0; u_base < rows; u_base += eff_tile) {
@@ -2415,7 +2423,7 @@ SparseFFTResult sparse_fft_csc_bluestein_mixed_radix(const COOMatrix& coo, int u
     cudaFree(d_work[0]);
     cudaFree(d_work[1]);
 
-    return {d_out, output_stride, ms, mem_bytes, {}};
+    return {d_out, output_stride, ms, mem_bytes, {}, preprocess_ms};
 }
 
 
@@ -2582,6 +2590,7 @@ SparseFFTResult sparse_fft_csc_bluestein_mixed_radix_graph(const COOMatrix& coo,
 // Non-streaming; allocates full d_out.
 // ===========================================================================
 SparseFFTResult sparse_fft_csc_bluestein_cufft_smooth(const COOMatrix& coo, int u_tile) {
+    const auto _pre0 = std::chrono::steady_clock::now();
     const int rows = coo.rows;
     const int cols = coo.cols;
     const int output_cols   = cols / 2 + 1;
@@ -2693,6 +2702,13 @@ SparseFFTResult sparse_fft_csc_bluestein_cufft_smooth(const COOMatrix& coo, int 
     cudaEvent_t t0, t1;
     CUDA_CHECK(cudaEventCreate(&t0));
     CUDA_CHECK(cudaEventCreate(&t1));
+
+    // Finish all setup GPU work (d_b_fft precompute, H2D, cuFFT plan workspace)
+    // so it is charged to preprocessing, not to the kernel timer.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const float preprocess_ms = std::chrono::duration<float, std::milli>(
+        std::chrono::steady_clock::now() - _pre0).count();
+
     CUDA_CHECK(cudaEventRecord(t0));
 
     for (int u_base = 0; u_base < rows; u_base += eff_tile) {
@@ -2776,5 +2792,5 @@ SparseFFTResult sparse_fft_csc_bluestein_cufft_smooth(const COOMatrix& coo, int 
     cudaFree(d_signal[0]);
     cudaFree(d_signal[1]);
 
-    return {d_out, output_stride, ms, mem_bytes, {}};
+    return {d_out, output_stride, ms, mem_bytes, {}, preprocess_ms};
 }

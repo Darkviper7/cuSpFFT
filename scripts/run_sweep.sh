@@ -46,7 +46,7 @@ STAMP=$(date +%Y%m%d_%H%M%S)
 SWEEP_LOG="$LOG_DIR/sweep_${STAMP}.log"
 CSV="$LOG_DIR/results.csv"
 
-CSV_HEADER="timestamp,matrix,rows,cols,nnz,method,median_ms,min_ms,max_ms,n_iters,mem_mb,max_abs,max_rel,rms_abs,error"
+CSV_HEADER="timestamp,matrix,rows,cols,nnz,method,median_ms,min_ms,max_ms,n_iters,mem_mb,preprocess_ms,max_abs,max_rel,rms_abs,error"
 
 # Migrate an older 14-column CSV out of the way so the new 15-column schema
 # (with trailing 'error' field) doesn't end up appended to a header that

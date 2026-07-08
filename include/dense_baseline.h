@@ -6,6 +6,7 @@
 struct DenseFFTResult {
     cuFloatComplex* d_output;   // device pointer, size rows*(cols/2+1), caller must free
     float           ms;         // kernel time in milliseconds
+    float           preprocess_ms = 0.f; // host setup: H2D + scatter + plan (pre-kernel)
     size_t          mem_bytes;  // peak device memory allocated (bytes)
 };
 

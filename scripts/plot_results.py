@@ -87,8 +87,9 @@ def classify_error(err: str) -> str:
 def load(csv_path: Path, small_max: int, medium_max: int) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
     for col in ("rows", "cols", "nnz", "median_ms", "min_ms", "max_ms",
-                "n_iters", "mem_mb", "max_abs", "max_rel", "rms_abs"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+                "n_iters", "mem_mb", "preprocess_ms", "max_abs", "max_rel", "rms_abs"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
     df["density"] = df["nnz"] / (df["rows"] * df["cols"])
     df["area"] = df["rows"] * df["cols"]
     df["pow2"] = df["cols"].apply(lambda c: is_power_of_two(int(c)) if pd.notna(c) else False)
