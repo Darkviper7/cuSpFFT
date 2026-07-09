@@ -526,6 +526,101 @@ __global__ void bluestein_finalize_sym_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Direct length-C DFT input build kernels (7-smooth cols fast path).
+// Identical to the Bluestein build kernels except the chirp[c] multiply is
+// dropped: signal[u_local*fft_len + c] = Σ_r exp(-2πi·r·u/rows), stored raw.
+// A single forward FFT of length cols over this row then yields F[u][.]
+// directly — no convolution kernel, no inverse FFT, no 1/L scale.
+// ---------------------------------------------------------------------------
+__global__ void csc_build_direct_input_kernel(
+    const int* __restrict__ col_ptr,
+    const int* __restrict__ row_idx,
+    const int* __restrict__ sparse_cols,
+    cuFloatComplex* __restrict__ signal,
+    int rows, int n_sparse_cols, int fft_len,
+    int u_base, int tile_rows, float inv_rows)
+{
+    const int col_id = blockIdx.x;
+    const int u_local = blockIdx.y * CSC_BU + threadIdx.x;
+    if (col_id >= n_sparse_cols || u_local >= tile_rows) return;
+
+    const int u = u_base + u_local;
+    if (u >= rows) return;
+    const int c = sparse_cols[col_id];
+
+    const int start = col_ptr[col_id];
+    const int end = col_ptr[col_id + 1];
+    float re = 0.f, im = 0.f;
+    for (int p = start; p < end; p++) {
+        float s, co;
+        sincos_twiddle(u, row_idx[p], rows, inv_rows, &s, &co);
+        re += co;
+        im += s;
+    }
+
+    signal[(size_t)u_local * fft_len + c] = make_cuFloatComplex(re, im);
+}
+
+__global__ void csc_build_direct_input_packed_kernel(
+    const int* __restrict__ col_ptr,
+    const uint16_t* __restrict__ row_idx,
+    const uint16_t* __restrict__ sparse_cols,
+    cuFloatComplex* __restrict__ signal,
+    int rows, int n_sparse_cols, int fft_len,
+    int u_base, int tile_rows, float inv_rows)
+{
+    const int col_id = blockIdx.x;
+    const int u_local = blockIdx.y * CSC_BU + threadIdx.x;
+    if (col_id >= n_sparse_cols || u_local >= tile_rows) return;
+
+    const int u = u_base + u_local;
+    if (u >= rows) return;
+    const int c = (int)sparse_cols[col_id];
+
+    const int start = col_ptr[col_id];
+    const int end = col_ptr[col_id + 1];
+    float re = 0.f, im = 0.f;
+    for (int p = start; p < end; p++) {
+        float s, co;
+        sincos_twiddle(u, (int)row_idx[p], rows, inv_rows, &s, &co);
+        re += co;
+        im += s;
+    }
+
+    signal[(size_t)u_local * fft_len + c] = make_cuFloatComplex(re, im);
+}
+
+// ---------------------------------------------------------------------------
+// Direct-path finalize — conjugate-symmetric dual write, no chirp.
+// conv holds F[u][.] verbatim (the forward FFT of the raw row-transformed
+// signal), so F[u][v] = conv[u_local][v] and the mirror row is
+// F[(rows-u)%rows][v] = conj(conv[u_local][(cols-v)%cols]).
+// conv width is fft_len = cols, and w = (cols-v)%cols < cols is in bounds.
+// ---------------------------------------------------------------------------
+__global__ void finalize_sym_direct_kernel(
+    const cuFloatComplex* __restrict__ conv,
+    cuFloatComplex* __restrict__ out,
+    int rows, int cols, int output_stride, int output_cols,
+    int fft_len, int u_base, int tile_rows)
+{
+    const int v = blockIdx.x * blockDim.x + threadIdx.x;
+    const int u_local = blockIdx.y * blockDim.y + threadIdx.y;
+    const int u = u_base + u_local;
+    const int rows_half = rows / 2 + 1;
+    if (v >= output_cols || u_local >= tile_rows || u >= rows_half) return;
+
+    cuFloatComplex y = conv[(size_t)u_local * fft_len + v];
+    out[(size_t)u * output_stride + v] = y;
+
+    const int m = (rows - u) % rows;          // mirror row (u==0 -> 0)
+    if (m != u) {
+        const int w = (cols - v) % cols;      // mirror column, always < cols
+        cuFloatComplex ym = conv[(size_t)u_local * fft_len + w];
+        out[(size_t)m * output_stride + v] = make_cuFloatComplex(ym.x, -ym.y);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stockham FFT host helpers
 // ---------------------------------------------------------------------------
 static void run_fft_power2(cuFloatComplex* d_in,
@@ -2850,7 +2945,193 @@ SparseFFTResult sparse_fft_csc_bluestein_cufft_smooth(const COOMatrix& coo, int 
 // from F[rows-u][v] = conj(F[u][(cols-v) mod cols]) and are filled by a
 // dual-write finalize kernel. Halves every per-tile kernel.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Direct length-C fast path for the sym variant ("Lever A").
+// When cols is already 7-smooth, the column transform
+//     F[u][v] = Σ_c R[u][c] · exp(-2πi·c·v/cols)
+// is exactly one forward length-cols DFT of the row-transformed sequence
+// R[u][.], so the whole Bluestein machinery (chirp modulate, ~2× padded
+// convolution with B_fft, inverse FFT, 1/L scale, chirp demodulate) is pure
+// overhead. This helper runs a single batched cufftExecC2C(FORWARD) of
+// length cols per tile instead, keeping the same double-buffered two-stream
+// tile structure and the conjugate-symmetric dual-write finalize.
+// ---------------------------------------------------------------------------
+static SparseFFTResult sparse_fft_csc_direct_cufft_sym(const COOMatrix& coo, int u_tile) {
+    const auto _pre0 = std::chrono::steady_clock::now();
+    const int rows = coo.rows;
+    const int cols = coo.cols;
+    const int rows_half     = rows / 2 + 1;   // computed rows; rest by conjugation
+    const int output_cols   = cols / 2 + 1;
+    const int output_stride = (output_cols + 3) / 4 * 4;
+    const int flen          = cols;           // direct DFT length — no Bluestein pad
+    const bool use_packed   = can_pack_u16(rows, cols);
+    if (u_tile <= 0)
+        throw std::runtime_error("CSC tile size must be positive");
+    // flen = cols is roughly half the Bluestein fft_len, so the 1.5M-element
+    // sweet spot admits about twice the tile rows per batch.
+    const int eff_tile = std::min(u_tile, std::max(8, 1500000 / flen));
+
+    DeviceMemPeak peak_tracker;
+    CompactCSC csc = make_compact_csc(coo);
+    const int n_sp = csc.n_sparse_cols;
+
+    int *d_col_ptr = nullptr, *d_row_idx = nullptr, *d_sp_cols = nullptr;
+    uint16_t *d_row_idx_packed = nullptr, *d_sp_cols_packed = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_col_ptr, (n_sp + 1) * sizeof(int)));
+    CUDA_CHECK(cudaMemcpy(d_col_ptr, csc.col_ptr.data(),
+                          (n_sp + 1) * sizeof(int), cudaMemcpyHostToDevice));
+    if (use_packed) {
+        std::vector<uint16_t> ri = pack_cols_u16(csc.row_idx.data(), coo.nnz);
+        std::vector<uint16_t> sp = pack_cols_u16(csc.sparse_cols.data(), n_sp);
+        CUDA_CHECK(cudaMalloc(&d_row_idx_packed, (size_t)coo.nnz * sizeof(uint16_t)));
+        CUDA_CHECK(cudaMalloc(&d_sp_cols_packed, (size_t)n_sp    * sizeof(uint16_t)));
+        CUDA_CHECK(cudaMemcpy(d_row_idx_packed, ri.data(),
+                              (size_t)coo.nnz * sizeof(uint16_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_sp_cols_packed, sp.data(),
+                              (size_t)n_sp * sizeof(uint16_t), cudaMemcpyHostToDevice));
+    } else {
+        CUDA_CHECK(cudaMalloc(&d_row_idx, (size_t)coo.nnz * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_sp_cols, (size_t)n_sp    * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_row_idx, csc.row_idx.data(),
+                              (size_t)coo.nnz * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_sp_cols, csc.sparse_cols.data(),
+                              (size_t)n_sp * sizeof(int), cudaMemcpyHostToDevice));
+    }
+    // No d_chirp / d_b_fft: the direct path has no chirp and no convolution.
+
+    const int max_tile_rows = std::min(eff_tile, rows_half);
+    // Double-buffered tile pipeline: two in-place d_signal slabs (cuFFT C2C
+    // runs in-place) and two streams so tile N's forward FFT can overlap with
+    // tile (N-1)'s finalize/d_out write.
+    cuFloatComplex *d_signal[2] = {nullptr, nullptr};
+    cuFloatComplex *d_out       = nullptr;
+    for (int i = 0; i < 2; ++i) {
+        CUDA_CHECK(cudaMalloc(&d_signal[i],
+            (size_t)max_tile_rows * flen * sizeof(cuFloatComplex)));
+    }
+    CUDA_CHECK(cudaMalloc(&d_out,
+        (size_t)rows * output_stride * sizeof(cuFloatComplex)));
+
+    cudaStream_t streams[2];
+    CUDA_CHECK(cudaStreamCreate(&streams[0]));
+    CUDA_CHECK(cudaStreamCreate(&streams[1]));
+
+    // One full-tile plan per stream, one shared last-tile plan whose stream is
+    // rebound dynamically (last tile runs only once).
+    cufftHandle plan_cufft[2] = {0, 0};
+    cufftHandle plan_cufft_last = 0;
+    size_t cufft_workspace = 0;
+    {
+        int fl = flen;
+        const int full_tile = max_tile_rows;
+        for (int i = 0; i < 2; ++i) {
+            CUFFT_CHECK(cufftPlanMany(&plan_cufft[i], 1, &fl, nullptr, 1, flen,
+                                      nullptr, 1, flen, CUFFT_C2C, full_tile));
+            CUFFT_CHECK(cufftSetStream(plan_cufft[i], streams[i]));
+            size_t ws = 0;
+            CUFFT_CHECK(cufftGetSize(plan_cufft[i], &ws));
+            cufft_workspace = std::max(cufft_workspace, ws);
+        }
+        const int last_tile = rows_half % eff_tile;
+        if (last_tile != 0 && last_tile != full_tile) {
+            CUFFT_CHECK(cufftPlanMany(&plan_cufft_last, 1, &fl, nullptr, 1, flen,
+                                      nullptr, 1, flen, CUFFT_C2C, last_tile));
+            size_t ws = 0;
+            CUFFT_CHECK(cufftGetSize(plan_cufft_last, &ws));
+            cufft_workspace = std::max(cufft_workspace, ws);
+        }
+    }
+
+    cudaEvent_t t0, t1;
+    CUDA_CHECK(cudaEventCreate(&t0));
+    CUDA_CHECK(cudaEventCreate(&t1));
+
+    // Finish all setup GPU work (H2D, cuFFT plan workspace) so it is charged
+    // to preprocessing, not to the kernel timer.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const float preprocess_ms = std::chrono::duration<float, std::milli>(
+        std::chrono::steady_clock::now() - _pre0).count();
+
+    CUDA_CHECK(cudaEventRecord(t0));
+
+    for (int u_base = 0; u_base < rows_half; u_base += eff_tile) {
+        const int tile_rows = std::min(eff_tile, rows_half - u_base);
+        const int buf = (u_base / eff_tile) & 1;
+        cudaStream_t stream = streams[buf];
+        cuFloatComplex* sig = d_signal[buf];
+        const size_t signal_bytes = (size_t)tile_rows * flen * sizeof(cuFloatComplex);
+        CUDA_CHECK(cudaMemsetAsync(sig, 0, signal_bytes, stream));
+
+        // Pass 1: binary CSC build, raw (no chirp) — signal[u][c] = R[u][c].
+        dim3 p1_block(CSC_BU);
+        dim3 p1_grid(n_sp, (tile_rows + CSC_BU - 1) / CSC_BU);
+        if (use_packed) {
+            csc_build_direct_input_packed_kernel<<<p1_grid, p1_block, 0, stream>>>(
+                d_col_ptr, d_row_idx_packed, d_sp_cols_packed, sig,
+                rows, n_sp, flen, u_base, tile_rows, 1.f / (float)rows);
+        } else {
+            csc_build_direct_input_kernel<<<p1_grid, p1_block, 0, stream>>>(
+                d_col_ptr, d_row_idx, d_sp_cols, sig,
+                rows, n_sp, flen, u_base, tile_rows, 1.f / (float)rows);
+        }
+        CUDA_CHECK(cudaGetLastError());
+
+        // One forward length-cols FFT IS the column DFT: sig[u][.] -> F[u][.].
+        cufftHandle tile_plan;
+        if (plan_cufft_last && tile_rows != max_tile_rows) {
+            CUFFT_CHECK(cufftSetStream(plan_cufft_last, stream));
+            tile_plan = plan_cufft_last;
+        } else {
+            tile_plan = plan_cufft[buf];
+        }
+        CUFFT_CHECK(cufftExecC2C(tile_plan,
+            reinterpret_cast<cufftComplex*>(sig),
+            reinterpret_cast<cufftComplex*>(sig),
+            CUFFT_FORWARD));
+        // (No pointwise multiply, no inverse FFT, no scale.)
+
+        // Finalize: copy F[u][v] to d_out plus the conjugate-mirror row.
+        dim3 f_block(32, 8);
+        dim3 f_grid((output_cols + f_block.x - 1) / f_block.x,
+                    (tile_rows + f_block.y - 1) / f_block.y);
+        finalize_sym_direct_kernel<<<f_grid, f_block, 0, stream>>>(
+            sig, d_out,
+            rows, cols, output_stride, output_cols, flen, u_base, tile_rows);
+        CUDA_CHECK(cudaGetLastError());
+    }
+
+    CUDA_CHECK(cudaStreamSynchronize(streams[0]));
+    CUDA_CHECK(cudaStreamSynchronize(streams[1]));
+    CUDA_CHECK(cudaEventRecord(t1));
+    CUDA_CHECK(cudaEventSynchronize(t1));
+    float ms = 0.f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, t0, t1));
+    const size_t mem_bytes = peak_tracker.finish();
+
+    cudaEventDestroy(t0);
+    cudaEventDestroy(t1);
+    cudaStreamDestroy(streams[0]);
+    cudaStreamDestroy(streams[1]);
+    if (plan_cufft[0]) cufftDestroy(plan_cufft[0]);
+    if (plan_cufft[1]) cufftDestroy(plan_cufft[1]);
+    if (plan_cufft_last) cufftDestroy(plan_cufft_last);
+    cudaFree(d_col_ptr);
+    cudaFree(d_row_idx);
+    cudaFree(d_sp_cols);
+    cudaFree(d_row_idx_packed);
+    cudaFree(d_sp_cols_packed);
+    cudaFree(d_signal[0]);
+    cudaFree(d_signal[1]);
+
+    return {d_out, output_stride, ms, mem_bytes, {}, preprocess_ms};
+}
+
 SparseFFTResult sparse_fft_csc_bluestein_cufft_smooth_sym(const COOMatrix& coo, int u_tile) {
+    // Lever A: when cols is already 7-smooth, a single direct length-cols DFT
+    // replaces the entire Bluestein chirp-convolution pipeline.
+    if (next_7_smooth(coo.cols) == coo.cols)
+        return sparse_fft_csc_direct_cufft_sym(coo, u_tile);
+
     const auto _pre0 = std::chrono::steady_clock::now();
     const int rows = coo.rows;
     const int cols = coo.cols;

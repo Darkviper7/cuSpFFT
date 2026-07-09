@@ -19,7 +19,9 @@ Usage: python3 scripts/gen_sampled_table.py > /tmp/sampled_rows.tex
 import csv, json, sys, os
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SHEET = os.path.join(ROOT, "results_sampled_v2", "sheet.csv")
+# sheet CSV path: first CLI arg, else the default 4090 sheet.
+SHEET = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
+    ROOT, "results_sampled_v2", "sheet.csv")
 JSON = "/home/smanthe/Documents/Binary_Sparse_FFT_GPU/sampled_matrices.json"
 
 
@@ -55,6 +57,16 @@ def cell(r, key):
     return "--"
 
 
+# peak-memory cell (MB, integer) for a method; blank when it didn't complete
+# (the kernel column already flags OOM/PLAN). Reads mem_mb from the raw per-method
+# sheet columns if present, else "".
+def mem_cell(r, key):
+    if r[f"{key}_status"] != "OK":
+        return ""
+    m = f(r.get(f"{key}_mem_mb"))
+    return f"{m:,.0f}" if m is not None else ""
+
+
 # kernel-time speedup of `key` over dense, '--' when dense (or key) failed
 def speedup_vs_dense(r, key):
     if r["dense_status"] == "OK" and r[f"{key}_status"] == "OK":
@@ -81,6 +93,8 @@ def main():
             shape, nnz, densf,
             cell(r, "dense"), cell(r, "mixedradix"),
             cell(r, "cufftsmooth"), cell(r, "cufftsmoothsym"),
+            mem_cell(r, "dense"), mem_cell(r, "mixedradix"),
+            mem_cell(r, "cufftsmooth"), mem_cell(r, "cufftsmoothsym"),
             speedup_vs_dense(r, "cufftsmooth"),
             speedup_vs_dense(r, "cufftsmoothsym"),
         ]

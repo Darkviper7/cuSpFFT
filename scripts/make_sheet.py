@@ -103,7 +103,7 @@ def main():
     cols = ["matrix", "rows", "cols", "nnz", "density"]
     for key in METHOD_ORDER:
         cols += [f"{key}_prep_ms", f"{key}_kernel_ms", f"{key}_total_ms",
-                 f"{key}_status"]
+                 f"{key}_mem_mb", f"{key}_status"]
     csv_out = out_prefix + ".csv"
     os.makedirs(os.path.dirname(csv_out) or ".", exist_ok=True)
     with open(csv_out, "w", newline="") as f:
@@ -118,7 +118,7 @@ def main():
             for key in METHOD_ORDER:
                 m = d["m"][key]
                 row += [fmt(m["prep"]), fmt(m["kernel"]), fmt(m["total"]),
-                        m["status"]]
+                        fmt(m["mem"]), m["status"]]
             w.writerow(row)
 
     # ---- HTML out ----
