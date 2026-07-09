@@ -71,6 +71,13 @@ SparseFFTResult sparse_fft_csc_bluestein_mixed_radix_graph(const COOMatrix& coo,
 // cuts fft_len from 32768 down to 16464, halving FFT work.  Non-streaming.
 SparseFFTResult sparse_fft_csc_bluestein_cufft_smooth(const COOMatrix& coo, int u_tile = 128);
 
+// Conjugate-symmetric variant of sparse_fft_csc_bluestein_cufft_smooth
+// (Lever B): the input matrix is real, so F[rows-u][v] =
+// conj(F[u][(cols-v) mod cols]).  The column transform runs only for
+// u in [0, rows/2] (rows/2 + 1 rows) and a dual-write finalize kernel
+// fills the mirror rows by conjugation, halving every per-tile kernel.
+SparseFFTResult sparse_fft_csc_bluestein_cufft_smooth_sym(const COOMatrix& coo, int u_tile = 128);
+
 // Experimental non-streaming binary-CSC variant using the Stockham smem FFT path.
 // Same byte-mask + LUT pass 1 as sparse_fft_csc_bluestein_binary_lut, but the
 // Bluestein convolution uses run_fft_power2_stockham_smem_stream (auto-falls

@@ -244,6 +244,7 @@ static void print_usage(const char* prog) {
         "  --csc-mixed-radix  Experimental binary-CSC + mixed-radix {2,3} Stockham Bluestein (no cuFFT)\n"
         "  --csc-mixed-radix-graph  Same as --csc-mixed-radix but with CUDA Graph capture/replay\n"
         "  --csc-cufft-smooth  cuFFT Bluestein with fft_len = next_7_smooth(2·cols−1) (best-possible cuFFT baseline)\n"
+        "  --csc-cufft-smooth-sym  Same as --csc-cufft-smooth but computes only rows u ≤ rows/2 and mirrors the rest by conjugate symmetry\n"
         "  --cpu-reference  Compute CPU FFT reference (FFTW3, single-threaded); used as ground truth for ALL variants\n"
         "  --repeat N       Run each benchmark N+1 times (1 warmup + N timed); report median, min, max (default 1)\n",
         prog);
@@ -279,6 +280,7 @@ int main(int argc, char** argv) {
     bool csc_mixed_radix = false;
     bool csc_mixed_radix_graph = false;
     bool csc_cufft_smooth = false;
+    bool csc_cufft_smooth_sym = false;
     bool run_cpu_ref = false;
     int csc_tile     = 1024;
     int repeat_iters = 1;
@@ -300,6 +302,7 @@ int main(int argc, char** argv) {
         else if (f == "--csc-mixed-radix") csc_mixed_radix = true;
         else if (f == "--csc-mixed-radix-graph") csc_mixed_radix_graph = true;
         else if (f == "--csc-cufft-smooth") csc_cufft_smooth = true;
+        else if (f == "--csc-cufft-smooth-sym") csc_cufft_smooth_sym = true;
         else if (f == "--cpu-reference") run_cpu_ref = true;
         else if (f == "--csc-tile") {
             if (++i >= argc)
@@ -529,6 +532,29 @@ int main(int argc, char** argv) {
             } catch (const std::exception& e) {
                 printf("%-26s  %10s  %12s  [%s]\n",
                        "Sparse CSC (cufft smooth)", "OOM", "OOM", e.what());
+                cudaGetLastError();
+            }
+        }
+
+        // ===========================================================================
+        // CSC binary-sparse + cuFFT smooth, conjugate-symmetric: computes only
+        // rows u in [0, rows/2] of the column transform and fills the mirror
+        // rows via F[rows-u][v] = conj(F[u][(cols-v) mod cols]).
+        // ===========================================================================
+        if (run_2pass && csc_cufft_smooth_sym) {
+            NvtxRange _range("Sparse CSC (cuFFT smooth sym)");
+            try {
+                float min_ms = 0, max_ms = 0;
+                SparseFFTResult sc = run_repeated<SparseFFTResult>(repeat_iters,
+                    [&] { return sparse_fft_csc_bluestein_cufft_smooth_sym(coo, csc_tile); },
+                    &min_ms, &max_ms);
+                print_bench("Sparse CSC (cufft smooth sym)", sc.ms, sc.mem_bytes,
+                            repeat_iters, min_ms, max_ms, sc.preprocess_ms);
+                print_check("Sparse CSC cufft smooth sym", dense_ref, sc);
+                cudaFree(sc.d_output);
+            } catch (const std::exception& e) {
+                printf("%-26s  %10s  %12s  [%s]\n",
+                       "Sparse CSC (cufft smooth sym)", "OOM", "OOM", e.what());
                 cudaGetLastError();
             }
         }

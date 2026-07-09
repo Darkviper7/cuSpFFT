@@ -86,7 +86,7 @@ function record(method,    key) {
 # --- Failure (catch block: literal "OOM" tokens, real cause in brackets) -----
 # "Variant Label              OOM           OOM  [CUDA error: out of memory]"
 
-match($0, /^(.{26})  +OOM +OOM +\[(.*)\]$/, m) {
+match($0, /^(.+)  +OOM +OOM +\[(.*)\]$/, m) {
     method = trim_right(m[1])
     key = canon(method)
     timing[key] = "" OFS "" OFS "" OFS "" OFS ""
@@ -98,7 +98,7 @@ match($0, /^(.{26})  +OOM +OOM +\[(.*)\]$/, m) {
 # --- Repeat-mode summary ------------------------------------------------------
 # "Variant Label             123.456     789.01  [min 120.000, max 130.000]  n=10"
 
-match($0, /^(.{26})  +([0-9.]+) +([0-9.]+) +\[min ([0-9.]+), max ([0-9.]+)\] +n=([0-9]+)( +prep ([0-9.]+))?/, m) {
+match($0, /^(.+)  +([0-9.]+) +([0-9.]+) +\[min ([0-9.]+), max ([0-9.]+)\] +n=([0-9]+)( +prep ([0-9.]+))?/, m) {
     method = trim_right(m[1])
     key = canon(method)
     timing[key] = m[2] OFS m[4] OFS m[5] OFS m[6] OFS m[3]
@@ -111,7 +111,7 @@ match($0, /^(.{26})  +([0-9.]+) +([0-9.]+) +\[min ([0-9.]+), max ([0-9.]+)\] +n=
 # "Variant Label             123.456     789.01"   (and tolerate trailing
 # annotations like "  [CPU, FFTW3 single-thread]")
 
-match($0, /^(.{26})  +([0-9.]+) +([0-9.]+)(  +prep ([0-9.]+))?([[:space:]].*)?$/, m) {
+match($0, /^(.+)  +([0-9.]+) +([0-9.]+)(  +prep ([0-9.]+))?([[:space:]].*)?$/, m) {
     method = trim_right(m[1])
     key = canon(method)
     if (!(key in timing)) {

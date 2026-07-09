@@ -22,12 +22,14 @@ import sys
 METHOD_KEY = {
     "Dense cuFFT (baseline)": "dense",
     "Sparse CSC (cufft smooth)": "cufftsmooth",
+    "Sparse CSC (cufft smooth sym)": "cufftsmoothsym",
     "Sparse CSC (mixed-radix)": "mixedradix",
 }
-METHOD_ORDER = ["dense", "cufftsmooth", "mixedradix"]
+METHOD_ORDER = ["dense", "cufftsmooth", "cufftsmoothsym", "mixedradix"]
 METHOD_TITLE = {
     "dense": "Dense cuFFT",
     "cufftsmooth": "CSC cuFFT-smooth",
+    "cufftsmoothsym": "CSC cuFFT-smooth-sym",
     "mixedradix": "CSC mixed-radix",
 }
 
